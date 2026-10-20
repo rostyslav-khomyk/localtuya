@@ -49,7 +49,7 @@
                     "add_device": "Add a new device",
                     "edit_device": "Edit a device",
                     "configure_cloud": "Reconfigure Cloud API account",
-                    "screen_colors": "Screen edge colors"
+                    "screen_colors": "Screen color server"
                 },
                 "data": {
                     "add_device": "Add a new device",
@@ -60,22 +60,14 @@
                 }
             },
             "screen_colors": {
-                "title": "Screen edge colors",
+                "title": "Screen color server",
                 "description": "{msg}",
                 "data": {
                     "server_name": "Server name",
                     "host": "Screen-edges host",
                     "port": "WebSocket port",
-                    "token": "Token",
-                    "device_id": "LED strip",
-                    "zone1_edge": "Zone 1 edge, at the controller",
-                    "zone1_cm": "Zone 1 length",
-                    "zone2_edge": "Zone 2 edge",
-                    "zone2_cm": "Zone 2 length",
-                    "zone3_edge": "Zone 3 edge",
-                    "zone3_cm": "Zone 3 length",
-                    "zone4_edge": "Zone 4 edge",
-                    "zone4_cm": "Zone 4 length (0 skips it)"
+                    "screen_code": "Token",
+                    "device_id": "LED strip"
                 }
             },
             "entity": {

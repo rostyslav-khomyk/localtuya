@@ -44,6 +44,7 @@ def _server(entry, name):
 class EdgeCache:
     def __init__(self):
         self.colors = {name: (0, 0, 0) for name in EDGES}
+        self.seen = False
         self.task = None
 
 
@@ -101,7 +102,7 @@ class ScreenHub:
         device = self.entry.data[CONF_DEVICES][device_id]
         sync = _sync(device)
         cache = self.edges.get(sync.get("server"))
-        if not cache:
+        if not cache or not cache.seen:
             return None, None
         zones = [zone for zone in sync.get("zones", []) if int(zone.get("cm") or 0) > 0]
         if not zones:
@@ -113,21 +114,28 @@ class ScreenHub:
 
     async def _follow(self, server, cache):
         url = f"ws://{server['host']}:{int(server.get('port') or 8090)}"
+        token = server.get("token") or ""
         while True:
             try:
+                if not token:
+                    raise RuntimeError("screen server has no token")
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url) as ws:
                         await ws.send_json(
                             {
                                 "command": "authorize",
                                 "subcommand": "login",
-                                "token": server["token"],
+                                "token": token,
                                 "tan": 1,
                             }
                         )
+                        login = await ws.receive_json(timeout=5)
+                        if not login.get("success"):
+                            raise RuntimeError(login.get("error") or "login was rejected")
                         await ws.send_json(
                             {"command": "ledcolors", "subcommand": "ledstream-start", "tan": 2}
                         )
+                        _LOGGER.info("Screen server %s is streaming", server.get("name"))
                         async for msg in ws:
                             if msg.type != aiohttp.WSMsgType.TEXT:
                                 continue
@@ -142,6 +150,7 @@ class ScreenHub:
                                 led = leds[index]
                                 rgb = led.get("RGB Value") if isinstance(led, dict) else led
                                 cache.colors[name] = tuple(int(v) for v in rgb[:3])
+                            cache.seen = True
             except asyncio.CancelledError:
                 raise
             except Exception as err:

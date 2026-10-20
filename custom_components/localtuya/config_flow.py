@@ -14,13 +14,11 @@ from typing import Any
 import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.entity_registry as er
 from homeassistant.helpers.selector import (
-    NumberSelector,
-    NumberSelectorConfig,
-    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
     SelectOptionDict,
+    TextSelector,
 )
 import voluptuous as vol
 from homeassistant import exceptions
@@ -297,55 +295,55 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         return self.async_show_menu(step_id="init", menu_options=configure_menu)
 
     async def async_step_screen_colors(self, user_input=None):
-        """Attach a Hyperion screen-edge server to a strip and set zone lengths."""
+        """Add a screen-edge server and attach it to a strip.
+
+        Zone lengths stay on the strip. This step does not edit them.
+        """
         devices = self.config_entry.data.get(CONF_DEVICES, {})
         if not devices:
             return self.async_abort(reason="no_devices")
+        stored = list(self.config_entry.data.get("screen_servers") or [])
         errors = {}
         if user_input is not None:
-            zones = []
-            for index in range(1, 5):
-                cm = int(user_input.get(f"zone{index}_cm") or 0)
-                if cm <= 0:
-                    continue
-                zones.append({"edge": user_input[f"zone{index}_edge"], "cm": cm})
-            if not zones:
-                errors["base"] = "unknown"
+            name = user_input["server_name"].strip()
+            previous = next((item for item in stored if item.get("name") == name), None)
+            code = (user_input.get("screen_code") or "").strip()
+            if not code and previous:
+                code = previous.get("token") or ""
+            if not name or not code:
+                errors["base"] = "invalid_auth"
             else:
                 new_data = copy.deepcopy(dict(self.config_entry.data))
-                servers = [
-                    item
-                    for item in new_data.get("screen_servers", [])
-                    if item.get("name") != user_input["server_name"]
-                ]
+                servers = [item for item in stored if item.get("name") != name]
                 servers.append(
                     {
-                        "name": user_input["server_name"],
-                        "host": user_input["host"],
+                        "name": name,
+                        "host": user_input["host"].strip(),
                         "port": int(user_input["port"]),
-                        "token": user_input["token"],
+                        "token": code,
                     }
                 )
                 new_data["screen_servers"] = servers
                 dev_id = user_input["device_id"]
-                new_data[CONF_DEVICES][dev_id]["screen_sync"] = {
-                    "server": user_input["server_name"],
-                    "enabled": True,
-                    "zones": zones,
-                }
+                sync = dict(new_data[CONF_DEVICES][dev_id].get("screen_sync") or {})
+                sync["server"] = name
+                sync["enabled"] = bool(sync.get("enabled", True))
+                sync.setdefault("zones", [])
+                new_data[CONF_DEVICES][dev_id]["screen_sync"] = sync
                 new_data[CONF_DEVICES][dev_id]["local_only"] = True
                 return self._update_entry(new_data)
 
-        edge = SelectSelector(
-            SelectSelectorConfig(
-                options=["left", "top", "right", "bottom"],
-                mode=SelectSelectorMode.DROPDOWN,
-            )
-        )
-        slider = NumberSelector(
-            NumberSelectorConfig(
-                min=0, max=400, step=1, mode=NumberSelectorMode.SLIDER, unit_of_measurement="cm"
-            )
+        current = next((item for item in stored if item.get("name") == "Mac mini"), None)
+        if current is None and stored:
+            current = stored[0]
+        current = current or {}
+        attached = next(
+            (
+                dev_id
+                for dev_id, dev in devices.items()
+                if (dev.get("screen_sync") or {}).get("server") == current.get("name")
+            ),
+            next(iter(devices)),
         )
         device_select = SelectSelector(
             SelectSelectorConfig(
@@ -361,19 +359,11 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         )
         schema = vol.Schema(
             {
-                vol.Required("server_name", default="Mac mini"): str,
-                vol.Required("host", default="192.168.2.20"): str,
-                vol.Required("port", default=8090): int,
-                vol.Required("token"): str,
-                vol.Required("device_id"): device_select,
-                vol.Required("zone1_edge", default="left"): edge,
-                vol.Required("zone1_cm", default=27): slider,
-                vol.Required("zone2_edge", default="top"): edge,
-                vol.Required("zone2_cm", default=57): slider,
-                vol.Optional("zone3_edge", default="right"): edge,
-                vol.Optional("zone3_cm", default=27): slider,
-                vol.Optional("zone4_edge", default="bottom"): edge,
-                vol.Optional("zone4_cm", default=0): slider,
+                vol.Required("server_name", default=current.get("name") or "Mac mini"): str,
+                vol.Required("host", default=current.get("host") or "192.168.2.20"): str,
+                vol.Required("port", default=int(current.get("port") or 8090)): int,
+                vol.Required("screen_code", default=current.get("token") or ""): TextSelector(),
+                vol.Required("device_id", default=attached): device_select,
             }
         )
         return self.async_show_form(
@@ -381,9 +371,10 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             data_schema=schema,
             errors=errors,
             description_placeholders={
-                "msg": "Zone 1 starts at the controller. A length of 0 hides that zone. "
-                "The same server can be attached to more than one strip. "
-                "Saving locks that strip to its local key."
+                "msg": "Add the Mac that runs Screen Edges and choose which strip follows it. "
+                "The token is in the Screen Edges config file on that Mac. "
+                "Zone lengths and edges are set on the strip, not here. "
+                "Use the same server name to attach another strip."
             },
         )
 

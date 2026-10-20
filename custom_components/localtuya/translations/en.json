@@ -58,7 +58,19 @@
                 "menu_options": {
                     "add_device": "Add new device",
                     "edit_device": "Reconfigure existing device",
-                    "configure_cloud": "Manage Cloud API account"
+                    "configure_cloud": "Manage Cloud API account",
+                    "screen_colors": "Screen color server"
+                }
+            },
+            "screen_colors": {
+                "title": "Screen color server",
+                "description": "{msg}",
+                "data": {
+                    "server_name": "Server name",
+                    "host": "Screen-edges host",
+                    "port": "WebSocket port",
+                    "screen_code": "Token",
+                    "device_id": "LED strip"
                 }
             },
             "add_device": {

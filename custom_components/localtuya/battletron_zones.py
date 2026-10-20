@@ -3,12 +3,15 @@
 import asyncio
 import hashlib
 import hmac
+import logging
 import os
 import socket
 import struct
 import zlib
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+_LOGGER = logging.getLogger(__name__)
 
 from .screen_layout import color_payload
 
@@ -48,12 +51,16 @@ class ZoneSender:
         self._devices = {}
 
     def add(self, device_id, local_key, host):
-        key = local_key.encode("utf-8")[:16]
+        raw = local_key.encode("utf-8")
+        key = bytes.fromhex(raw.hex().ljust(32, "0")[:32])
         controller_crc = _crc32(_pad_id(CONTROLLER_UUID))
         device_crc = _crc32(_pad_id(device_id) + controller_crc)
+        bind_ip = _route(host)
         self._devices[device_id] = {
             "key": key,
             "host": host,
+            "bind_ip": bind_ip,
+            "targets": _targets(host, bind_ip),
             "controller_crc": controller_crc,
             "device_crc": device_crc,
             "session": None,
@@ -72,9 +79,10 @@ class ZoneSender:
     def _socket(self):
         if self._sock:
             return self._sock
+        bind_ip = next((dev["bind_ip"] for dev in self._devices.values() if dev.get("bind_ip")), "0.0.0.0")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("0.0.0.0", PORT))
+        sock.bind((bind_ip, PORT))
         sock.setblocking(False)
         self._sock = sock
         return sock
@@ -110,7 +118,11 @@ class ZoneSender:
             ]
         )
         sock = self._socket()
-        sock.sendto(packet, (dev["host"], PORT))
+        for target in dev["targets"]:
+            try:
+                sock.sendto(packet, (target, PORT))
+            except OSError:
+                continue
 
     def pump(self):
         """Read one reply, if any. Returns the device id that completed negotiation."""
@@ -150,16 +162,22 @@ class ZoneSender:
 
 
 async def run_zone_loop(sender, device_ids, color_fn, interval=0.25):
-    """Negotiate, then keep sending colors from `color_fn(device_id)`."""
+    """Negotiate until each strip answers, then keep sending colors."""
     loop = asyncio.get_running_loop()
-    for device_id in device_ids:
-        await loop.run_in_executor(None, sender.negotiate, device_id)
     ready = set()
+    last_negotiate = 0.0
     try:
         while True:
+            now = loop.time()
+            if now - last_negotiate >= 1:
+                for device_id in device_ids:
+                    if device_id not in ready:
+                        await loop.run_in_executor(None, sender.negotiate, device_id)
+                last_negotiate = now
             finished = await loop.run_in_executor(None, sender.pump)
             if finished:
                 ready.add(finished)
+                _LOGGER.info("Zone session ready for %s", finished)
             for device_id in ready:
                 colors, counts = color_fn(device_id)
                 if colors:
@@ -167,3 +185,24 @@ async def run_zone_loop(sender, device_ids, color_fn, interval=0.25):
             await asyncio.sleep(interval)
     finally:
         sender.close()
+
+
+def _route(host):
+    """Source address this machine uses to reach the strip."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((host, PORT))
+        return probe.getsockname()[0]
+    except OSError:
+        return "0.0.0.0"
+    finally:
+        probe.close()
+
+
+def _targets(host, bind_ip):
+    """Unicast the strip, and also the subnet broadcast the Mac client uses."""
+    targets = [host]
+    parts = (bind_ip if bind_ip != "0.0.0.0" else host).split(".")
+    if len(parts) == 4:
+        targets.append(".".join(parts[:3] + ["255"]))
+    return list(dict.fromkeys(targets))
