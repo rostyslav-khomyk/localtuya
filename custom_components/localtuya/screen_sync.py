@@ -268,5 +268,5 @@ async def async_add_selects(hass, entry, async_add_entities):
 async def async_start_hub(hass, entry):
     hub = ScreenHub(hass, entry)
     await hub.start()
-    entry.async_on_unload(lambda: hass.async_create_task(hub.stop()))
+    entry.async_on_unload(hub.stop)
     return hub
