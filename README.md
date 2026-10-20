@@ -8,6 +8,8 @@
 
 __A Home Assistant custom Integration for local handling of Tuya-based devices.__
 
+This fork tracks [hass-localtuya](https://github.com/xZetsubou/hass-localtuya), including Tuya protocol 3.5. It adds Hyperion screen-edge zones for Battletron strips. Setup is in [docs/SCREEN_EDGES.md](docs/SCREEN_EDGES.md). The grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges).
+
 ### **Usage and setup [Documentation](https://xzetsubou.github.io/hass-localtuya/)**
 
 <br>

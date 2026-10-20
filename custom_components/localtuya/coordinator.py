@@ -506,6 +506,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     async def _update_local_key(self):
         """Retrieve updated local_key from Cloud API and update the config_entry."""
+        if self._device_config.device_config.get("local_only"):
+            return self.info("Local key is locked. Cloud refresh is skipped.")
+
         if self._entry.data.get(CONF_NO_CLOUD, True):
             return self.info("Ensure that localkey hasn't changed and it's correct")
 

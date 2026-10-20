@@ -95,4 +95,12 @@ class LocalTuyaSelect(LocalTuyaEntity, SelectEntity):
         return self._options.names[0]
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSelect, flow_schema)
+_platform_setup = partial(async_setup_entry, DOMAIN, LocalTuyaSelect, flow_schema)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up DP selects and screen-zone edge selects."""
+    await _platform_setup(hass, entry, async_add_entities)
+    from .screen_sync import async_add_selects
+
+    await async_add_selects(hass, entry, async_add_entities)

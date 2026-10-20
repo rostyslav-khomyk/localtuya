@@ -395,6 +395,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     await async_remove_orphan_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
 
+    from .screen_sync import async_start_hub
+
+    await async_start_hub(hass, entry)
+
     # Note: entry.async_on_unload items are called in LIFO order!
 
     for dev in connect_to_devices:

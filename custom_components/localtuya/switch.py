@@ -100,4 +100,12 @@ class LocalTuyaSwitch(LocalTuyaEntity, SwitchEntity):
         return False
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaSwitch, flow_schema)
+_platform_setup = partial(async_setup_entry, DOMAIN, LocalTuyaSwitch, flow_schema)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up DP switches and the screen-sync switch."""
+    await _platform_setup(hass, entry, async_add_entities)
+    from .screen_sync import async_add_switches
+
+    await async_add_switches(hass, entry, async_add_entities)

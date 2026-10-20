@@ -130,4 +130,12 @@ class LocalTuyaNumber(LocalTuyaEntity, NumberEntity):
         return self._min_value
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaNumber, flow_schema)
+_platform_setup = partial(async_setup_entry, DOMAIN, LocalTuyaNumber, flow_schema)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up DP numbers and screen-zone length sliders."""
+    await _platform_setup(hass, entry, async_add_entities)
+    from .screen_sync import async_add_numbers
+
+    await async_add_numbers(hass, entry, async_add_entities)

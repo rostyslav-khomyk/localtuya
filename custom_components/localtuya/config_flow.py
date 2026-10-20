@@ -14,6 +14,9 @@ from typing import Any
 import homeassistant.helpers.config_validation as cv
 import homeassistant.helpers.entity_registry as er
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -93,7 +96,12 @@ TUYA_CATEGORY = "category"
 DEVICE_CLOUD_DATA = "device_cloud_data"
 
 # Using list method so we can translate options.
-CONFIGURE_MENU = [CONF_ADD_DEVICE, CONF_EDIT_DEVICE, CONF_CONFIGURE_CLOUD]
+CONFIGURE_MENU = [
+    CONF_ADD_DEVICE,
+    CONF_EDIT_DEVICE,
+    CONF_CONFIGURE_CLOUD,
+    "screen_colors",
+]
 
 
 def col_to_select(
@@ -287,6 +295,97 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             self.hass.async_create_task(self.cloud_data.async_get_devices_list())
 
         return self.async_show_menu(step_id="init", menu_options=configure_menu)
+
+    async def async_step_screen_colors(self, user_input=None):
+        """Attach a Hyperion screen-edge server to a strip and set zone lengths."""
+        devices = self.config_entry.data.get(CONF_DEVICES, {})
+        if not devices:
+            return self.async_abort(reason="no_devices")
+        errors = {}
+        if user_input is not None:
+            zones = []
+            for index in range(1, 5):
+                cm = int(user_input.get(f"zone{index}_cm") or 0)
+                if cm <= 0:
+                    continue
+                zones.append({"edge": user_input[f"zone{index}_edge"], "cm": cm})
+            if not zones:
+                errors["base"] = "unknown"
+            else:
+                new_data = copy.deepcopy(dict(self.config_entry.data))
+                servers = [
+                    item
+                    for item in new_data.get("screen_servers", [])
+                    if item.get("name") != user_input["server_name"]
+                ]
+                servers.append(
+                    {
+                        "name": user_input["server_name"],
+                        "host": user_input["host"],
+                        "port": int(user_input["port"]),
+                        "token": user_input["token"],
+                    }
+                )
+                new_data["screen_servers"] = servers
+                dev_id = user_input["device_id"]
+                new_data[CONF_DEVICES][dev_id]["screen_sync"] = {
+                    "server": user_input["server_name"],
+                    "enabled": True,
+                    "zones": zones,
+                }
+                new_data[CONF_DEVICES][dev_id]["local_only"] = True
+                return self._update_entry(new_data)
+
+        edge = SelectSelector(
+            SelectSelectorConfig(
+                options=["left", "top", "right", "bottom"],
+                mode=SelectSelectorMode.DROPDOWN,
+            )
+        )
+        slider = NumberSelector(
+            NumberSelectorConfig(
+                min=0, max=400, step=1, mode=NumberSelectorMode.SLIDER, unit_of_measurement="cm"
+            )
+        )
+        device_select = SelectSelector(
+            SelectSelectorConfig(
+                options=[
+                    SelectOptionDict(
+                        value=dev_id,
+                        label=dev.get(CONF_FRIENDLY_NAME) or dev_id,
+                    )
+                    for dev_id, dev in devices.items()
+                ],
+                mode=SelectSelectorMode.DROPDOWN,
+            )
+        )
+        schema = vol.Schema(
+            {
+                vol.Required("server_name", default="Mac mini"): str,
+                vol.Required("host", default="192.168.2.20"): str,
+                vol.Required("port", default=8090): int,
+                vol.Required("token"): str,
+                vol.Required("device_id"): device_select,
+                vol.Required("zone1_edge", default="left"): edge,
+                vol.Required("zone1_cm", default=27): slider,
+                vol.Required("zone2_edge", default="top"): edge,
+                vol.Required("zone2_cm", default=57): slider,
+                vol.Optional("zone3_edge", default="right"): edge,
+                vol.Optional("zone3_cm", default=27): slider,
+                vol.Optional("zone4_edge", default="bottom"): edge,
+                vol.Optional("zone4_cm", default=0): slider,
+            }
+        )
+        return self.async_show_form(
+            step_id="screen_colors",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={
+                "msg": "Zone 1 starts at the controller. A length of 0 hides that zone. "
+                "The same server can be attached to more than one strip. "
+                "Saving locks that strip to its local key."
+            },
+        )
 
     async def async_step_configure_cloud(self, user_input=None):
         """Handle the initial step."""
