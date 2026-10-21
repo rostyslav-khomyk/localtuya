@@ -23,7 +23,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.util import color as color_util
 
 from .battletron_zones import ZoneSender, run_zone_loop
-from .const import CONF_LOCAL_KEY, DOMAIN
+from .const import CONF_COLOR_MODE, CONF_LOCAL_KEY, DOMAIN
 from .screen_layout import zone_counts
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,11 +64,24 @@ def _tuya_device(hass, entry, device_id: str):
     return None
 
 
-def _power_dp(device: dict):
+def _light_entity(device: dict) -> dict | None:
     for entity in device.get("entities") or []:
         if str(entity.get("platform", "")).lower() == "light":
-            return entity.get("id")
+            return entity
     return None
+
+
+def _power_dp(device: dict):
+    ent = _light_entity(device)
+    return ent.get("id") if ent else None
+
+
+def _mode_dp(device: dict):
+    """Work-mode DP (colour/music/scene). Music mode hides zone frames."""
+    ent = _light_entity(device)
+    if not ent:
+        return None
+    return ent.get(CONF_COLOR_MODE) or ent.get("color_mode")
 
 
 class ZonePaintHub:
@@ -277,21 +290,20 @@ class ZonePaintHub:
         power = _power_dp(device) if device else None
         if tuya is None or power is None:
             return
+        mode = _mode_dp(device) if device else None
         try:
-            tuya._zone_tcp_window = True
-            tuya._hold_tcp = False
-            await tuya.async_connect()
-            if tuya.connected:
-                dp = int(power) if str(power).isdigit() else power
-                await tuya.set_dps({dp: True})
-                await asyncio.sleep(0.25)
-                self._powered.add(device_id)
-                _LOGGER.info("Zone strip %s powered", device_id[:8])
+            # Colour mode + close TCP — same as Mac UDP clients. Power-only
+            # left the last solid colour (orange) on and hid zone frames when
+            # the strip was still in music/scene mode.
+            await tuya.async_power_for_zones(power, mode)
+            self._powered.add(device_id)
+            _LOGGER.info(
+                "Zone strip %s powered (mode_dp=%s)",
+                device_id[:8],
+                mode,
+            )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Could not power zone strip %s: %s", device_id[:8], err)
-        finally:
-            tuya._zone_tcp_window = False
-            await tuya.async_hold_tcp()
 
     async def _power_off(self, device_id: str):
         """Turn the physical strip off so an all-off zone set stays dark."""

@@ -76,6 +76,8 @@ class ZoneSender:
     def __init__(self):
         self._sock: socket.socket | None = None
         self._devices: dict[str, dict] = {}
+        # paint_now (executor) and the zone thread must not race-bind :40001.
+        self._io = threading.Lock()
 
     def add(self, device_id: str, local_key: str, host: str) -> None:
         raw = local_key.encode("utf-8")
@@ -89,7 +91,9 @@ class ZoneSender:
             "key": key,
             "host": host,
             "bind_ip": bind_ip,
-            "targets": _targets(host, bind_ip),
+            # Unicast first (reliable), then subnet broadcast — strip.js reverses
+            # this order on the Mac; HA's host needs unicast to win.
+            "targets": list(reversed(_targets(host, bind_ip))),
             "controller_crc": controller_crc,
             "device_crc": device_crc,
             "session": None,
@@ -100,16 +104,17 @@ class ZoneSender:
         }
 
     def close(self) -> None:
-        sock = self._sock
-        self._sock = None
-        if sock:
-            try:
-                sock.close()
-            except OSError:
-                pass
-        self._devices.clear()
+        with self._io:
+            sock = self._sock
+            self._sock = None
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._devices.clear()
 
-    def _socket(self) -> socket.socket:
+    def _socket_unlocked(self) -> socket.socket:
         if self._sock:
             return self._sock
         bind_ip = next(
@@ -119,7 +124,8 @@ class ZoneSender:
         last_err: OSError | None = None
         for attempt in range(12):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Match strip.js (reuseAddr: false) — SO_REUSEADDR let two threads
+            # both bind and then split negotiate replies from colour sends.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             try:
                 sock.bind((bind_ip, PORT))
@@ -139,20 +145,22 @@ class ZoneSender:
         raise last_err
 
     def negotiate(self, device_id: str) -> None:
-        dev = self._devices.get(device_id)
-        if not dev:
-            return
-        plain = b"\x00\x00\x00\x00" + dev["token"] + dev["rnd"]
-        self._send(dev, NEGOTIATE, plain, FIXED_KEY)
+        with self._io:
+            dev = self._devices.get(device_id)
+            if not dev:
+                return
+            plain = b"\x00\x00\x00\x00" + dev["token"] + dev["rnd"]
+            self._send_unlocked(dev, NEGOTIATE, plain, FIXED_KEY)
 
     def send_colors(self, device_id: str, colors, counts) -> None:
-        dev = self._devices.get(device_id)
-        if not dev or not dev["session"]:
-            return
-        plain = bytes.fromhex(color_payload(colors, counts))
-        self._send(dev, COLORS, plain, dev["session"])
+        with self._io:
+            dev = self._devices.get(device_id)
+            if not dev or not dev["session"]:
+                return
+            plain = bytes.fromhex(color_payload(colors, counts))
+            self._send_unlocked(dev, COLORS, plain, dev["session"])
 
-    def _send(self, dev: dict, kind: int, plain: bytes, key: bytes) -> None:
+    def _send_unlocked(self, dev: dict, kind: int, plain: bytes, key: bytes) -> None:
         nonce = os.urandom(12)
         extra = _aad(dev["sequence"], kind, dev["controller_crc"], len(plain) + 24, 1)
         dev["sequence"] = (dev["sequence"] + 1) & 0xFFFFFFFF
@@ -170,51 +178,52 @@ class ZoneSender:
                 TAIL,
             ]
         )
-        sock = self._socket()
+        sock = self._socket_unlocked()
         for target in dev["targets"]:
             try:
                 sock.sendto(packet, (target, PORT))
-            except OSError:
-                continue
+            except OSError as err:
+                _LOGGER.debug("Zone send to %s failed: %s", target, err)
 
     def pump(self) -> str | None:
         """Read one negotiate reply. Returns the device id that completed."""
-        sock = self._socket()
-        try:
-            msg, _addr = sock.recvfrom(2048)
-        except (TimeoutError, BlockingIOError, OSError):
-            return None
-        if len(msg) < 64 or not msg.startswith(HEADER) or not msg.endswith(TAIL):
-            return None
-        kind = struct.unpack(">I", msg[10:14])[0]
-        if kind != NEGOTIATE_REPLY:
-            return None
-        data_len = struct.unpack(">I", msg[42:46])[0]
-        frame_aad = msg[4:26]
-        nonce = msg[26:38]
-        enc = msg[46 : 46 + data_len]
-        tag = msg[46 + data_len : 46 + data_len + 16]
-        for device_id, dev in self._devices.items():
-            if dev["session"]:
-                continue
+        with self._io:
+            sock = self._socket_unlocked()
             try:
-                plain = AESGCM(dev["negotiation"]).decrypt(nonce, enc + tag, frame_aad)
-            except Exception:
-                continue
-            if len(plain) < 80:
-                continue
-            rnd_b = plain[:16]
-            rnd_hmac = plain[16:48]
-            session_hmac = plain[48:80]
-            if hmac.new(dev["negotiation"], dev["rnd"], hashlib.sha256).digest() != rnd_hmac:
-                continue
-            mixed = bytes(a ^ b for a, b in zip(dev["rnd"], rnd_b))
-            session = _gcm(mixed, dev["rnd"][:12], None, dev["negotiation"])[:16]
-            if hmac.new(dev["negotiation"], session, hashlib.sha256).digest() != session_hmac:
-                continue
-            dev["session"] = session
-            return device_id
-        return None
+                msg, _addr = sock.recvfrom(2048)
+            except (TimeoutError, BlockingIOError, OSError):
+                return None
+            if len(msg) < 64 or not msg.startswith(HEADER) or not msg.endswith(TAIL):
+                return None
+            kind = struct.unpack(">I", msg[10:14])[0]
+            if kind != NEGOTIATE_REPLY:
+                return None
+            data_len = struct.unpack(">I", msg[42:46])[0]
+            frame_aad = msg[4:26]
+            nonce = msg[26:38]
+            enc = msg[46 : 46 + data_len]
+            tag = msg[46 + data_len : 46 + data_len + 16]
+            for device_id, dev in self._devices.items():
+                if dev["session"]:
+                    continue
+                try:
+                    plain = AESGCM(dev["negotiation"]).decrypt(nonce, enc + tag, frame_aad)
+                except Exception:
+                    continue
+                if len(plain) < 80:
+                    continue
+                rnd_b = plain[:16]
+                rnd_hmac = plain[16:48]
+                session_hmac = plain[48:80]
+                if hmac.new(dev["negotiation"], dev["rnd"], hashlib.sha256).digest() != rnd_hmac:
+                    continue
+                mixed = bytes(a ^ b for a, b in zip(dev["rnd"], rnd_b))
+                session = _gcm(mixed, dev["rnd"][:12], None, dev["negotiation"])[:16]
+                if hmac.new(dev["negotiation"], session, hashlib.sha256).digest() != session_hmac:
+                    continue
+                dev["session"] = session
+                return device_id
+            return None
 
 
 def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: float, stop: threading.Event):
