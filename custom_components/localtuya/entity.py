@@ -380,6 +380,11 @@ class LocalTuyaEntity(RestoreEntity, pytuya.ContextualLogger):
         Which indicates a DPS that needs to be set before it starts returning
         status.
         """
+        from .screen_sync import screen_sync_enabled
+
+        if screen_sync_enabled(self._device._entry, self._device.id):
+            return
+
         restore_on_reconnect = self._config.get(CONF_RESTORE_ON_RECONNECT, False)
         passive_entity = self._config.get(CONF_PASSIVE_ENTITY, False)
         dp_id = str(self._dp_id)

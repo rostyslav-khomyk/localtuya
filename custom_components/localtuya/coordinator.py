@@ -93,6 +93,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         self.is_closing = False
         self._zone_tcp_window = False
+        self._hold_tcp = False
         self._task_connect: asyncio.Task | None = None
         self._task_reconnect: asyncio.Task | None = None
         self._task_shutdown_entities: asyncio.Task | None = None
@@ -160,6 +161,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         """Screen sync uses the zone link. The color connection has to stay closed."""
         if self._zone_tcp_window:
             return False
+        if self._hold_tcp:
+            return True
         try:
             device = self._entry.data.get(CONF_DEVICES, {}).get(self.id) or {}
         except (AttributeError, TypeError):
@@ -301,7 +304,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             # Attempt to restore status for all entities that need to first set
             # the DPS value before the device will respond with status.
             for entity in self._entities:
-                await entity.restore_state_when_connected()
+                restore = getattr(entity, "restore_state_when_connected", None)
+                if restore is not None:
+                    await restore()
 
             if self._unsub_new_entity is None:
 
@@ -357,6 +362,31 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         if self._interface is not None:
             await self._interface.close()
             self._interface = None
+
+    async def async_hold_tcp(self) -> None:
+        """Close the color link and do not open it again until released."""
+        self._hold_tcp = True
+        if self._task_reconnect:
+            self._task_reconnect.cancel()
+            try:
+                await self._task_reconnect
+            except asyncio.CancelledError:
+                pass
+            self._task_reconnect = None
+        if self._task_connect:
+            self._task_connect.cancel()
+            try:
+                await self._task_connect
+            except asyncio.CancelledError:
+                pass
+            self._task_connect = None
+        await self.abort_connect()
+
+    async def async_release_tcp(self) -> None:
+        """Let the color link come back without restoring a previous on/off."""
+        self._hold_tcp = False
+        self._pending_status = {}
+        await self.async_connect()
 
     async def check_connection(self):
         """Ensure that the device is not still connecting; if it is, wait for it."""

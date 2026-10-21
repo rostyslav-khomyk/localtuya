@@ -200,13 +200,6 @@ async def _persist_and_reload(hass, entry):
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-def _light_power_dp(device):
-    for entity in device.get("entities") or []:
-        if str(entity.get("platform", "")).lower() == "light":
-            return entity.get("id")
-    return None
-
-
 def _poke(tuya):
     """Ask the strip's entities to read the switches again."""
     if tuya is None:
@@ -240,12 +233,6 @@ class ScreenSyncSwitch(SwitchEntity):
         device = self._entry.data[CONF_DEVICES].get(self._device_id) or {}
         return bool(_sync(device).get("enabled"))
 
-    async def async_added_to_hass(self):
-        await super().async_added_to_hass()
-        tuya = _tuya_device(self.hass, self._entry, self._device_id)
-        if tuya is not None:
-            tuya.add_entities([self])
-
     async def async_turn_on(self, **kwargs):
         """Close the color link and follow the screen. The saved color stays stored."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
@@ -255,7 +242,7 @@ class ScreenSyncSwitch(SwitchEntity):
         _save(self.hass, self._entry)
         tuya = _tuya_device(self.hass, self._entry, self._device_id)
         if tuya is not None:
-            await tuya.abort_connect()
+            await tuya.async_hold_tcp()
         hub = _hubs(self.hass).get(self._entry.entry_id)
         if hub:
             await hub.restart_zones()
@@ -263,7 +250,7 @@ class ScreenSyncSwitch(SwitchEntity):
         _poke(tuya)
 
     async def async_turn_off(self, **kwargs):
-        """Stop screen sync and switch the strip off without changing its color."""
+        """Stop screen sync. Leave the light off. Do not rewrite its color."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         sync["enabled"] = False
@@ -273,13 +260,9 @@ class ScreenSyncSwitch(SwitchEntity):
         if hub:
             await hub.restart_zones()
         tuya = _tuya_device(self.hass, self._entry, self._device_id)
-        power = _light_power_dp(device)
-        if tuya is not None and power is not None:
-            try:
-                await tuya.async_connect()
-                await tuya.set_dp(False, power)
-            except Exception as err:
-                _LOGGER.warning("Could not turn %s off: %s", self._device_id, err)
+        if tuya is not None:
+            tuya._pending_status = {}
+            await tuya.async_release_tcp()
         self.schedule_update_ha_state()
         _poke(tuya)
 
@@ -488,7 +471,8 @@ async def async_release_screen_sync(device):
     hub = _hubs(device.hass).get(entry.entry_id)
     if hub:
         await hub.restart_zones()
-    await device.async_connect()
+    device._pending_status = {}
+    await device.async_release_tcp()
     _poke(device)
 
 

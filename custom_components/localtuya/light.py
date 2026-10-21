@@ -646,6 +646,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""
+        if self._screen_sync_active():
+            from .screen_sync import async_release_screen_sync
+
+            await async_release_screen_sync(self._device)
+        self._state = False
         await self._device.set_dp(False, self._dp_id)
 
     def status_updated(self):
