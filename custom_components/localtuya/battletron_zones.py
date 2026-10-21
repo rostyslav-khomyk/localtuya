@@ -91,9 +91,8 @@ class ZoneSender:
             "key": key,
             "host": host,
             "bind_ip": bind_ip,
-            # Unicast first (reliable), then subnet broadcast — strip.js reverses
-            # this order on the Mac; HA's host needs unicast to win.
-            "targets": list(reversed(_targets(host, bind_ip))),
+            # Match strip.js: subnet broadcast first, then unicast.
+            "targets": _targets(host, bind_ip),
             "controller_crc": controller_crc,
             "device_crc": device_crc,
             "session": None,
