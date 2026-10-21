@@ -244,11 +244,7 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
                     continue
                 if device_id not in painting:
                     painting.add(device_id)
-                    _LOGGER.info(
-                        "Painting %s from the screen %s",
-                        device_id,
-                        " ".join(str(tuple(c)) for c in colors),
-                    )
+                    _LOGGER.info("Zone UDP session painting %s", device_id[:8])
                 sender.send_colors(device_id, colors, counts)
             stop.wait(interval)
     except Exception:

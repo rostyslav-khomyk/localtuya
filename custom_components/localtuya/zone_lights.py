@@ -1,13 +1,14 @@
 """Battletron zones as normal HA colour lights.
 
-localtuya only splits the strip into zone lights + lengths. Colour comes from
-HA ``light.turn_on`` (UI, Screen Edges, HomeKit, …) and is painted over UDP.
+Turning a zone on/off or changing its colour must paint that segment over UDP.
+Screen Edges is just another caller of light.turn_on — same path as the HA UI.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.light import (
@@ -71,7 +72,7 @@ def _power_dp(device: dict):
 
 
 class ZonePaintHub:
-    """Shared UDP painter. One socket on :40001 for every strip with zones on."""
+    """One UDP :40001 painter for all strips that have zone lights on."""
 
     def __init__(self, hass, entry):
         self.hass = hass
@@ -80,8 +81,9 @@ class ZonePaintHub:
         self._run = None
         self._lock = asyncio.Lock()
         self._powered: set[str] = set()
-        # device_id -> [{"on": bool, "rgb": (r,g,b)}, ...]
+        # device_id -> [{"on": bool, "rgb": (r,g,b)}, ...]  rgb is what goes on the wire
         self._state: dict[str, list[dict]] = {}
+        self._last_logged: dict[str, tuple] = {}
 
     def _device(self, device_id: str) -> dict | None:
         return (self.entry.data.get(CONF_DEVICES) or {}).get(device_id)
@@ -91,14 +93,24 @@ class ZonePaintHub:
         zones = _zones(device) if device else []
         current = self._state.get(device_id)
         if current is None or len(current) != len(zones):
-            current = [{"on": False, "rgb": (0, 0, 0)} for _ in zones]
+            # Preserve existing slots when growing/shrinking where possible.
+            fresh = []
+            for i in range(len(zones)):
+                if current and i < len(current):
+                    fresh.append(dict(current[i]))
+                else:
+                    fresh.append({"on": False, "rgb": (0, 0, 0)})
+            current = fresh
             self._state[device_id] = current
         return current
 
     def set_zone(self, device_id: str, index: int, *, is_on: bool, rgb: tuple[int, int, int]):
         state = self._ensure_state(device_id)
         if 0 <= index < len(state):
-            state[index] = {"on": is_on, "rgb": (int(rgb[0]), int(rgb[1]), int(rgb[2]))}
+            state[index] = {
+                "on": bool(is_on),
+                "rgb": (int(rgb[0]), int(rgb[1]), int(rgb[2])) if is_on else (0, 0, 0),
+            }
 
     def zone_state(self, device_id: str, index: int) -> dict:
         state = self._ensure_state(device_id)
@@ -131,6 +143,7 @@ class ZonePaintHub:
             if cm <= 0:
                 continue
             slot = state[index] if index < len(state) else {"on": False, "rgb": (0, 0, 0)}
+            # Off zone → black on the wire so that segment stays dark.
             rgb = tuple(slot["rgb"]) if slot.get("on") else (0, 0, 0)
             if slot.get("on"):
                 any_on = True
@@ -138,6 +151,15 @@ class ZonePaintHub:
             lengths.append(cm)
         if not any_on or not colors:
             return None, None
+        key = (device_id, tuple(colors), tuple(lengths))
+        if self._last_logged.get(device_id) != key:
+            self._last_logged[device_id] = key
+            _LOGGER.info(
+                "Zone colours %s %s counts=%s",
+                device_id[:8],
+                " ".join(str(c) for c in colors),
+                zone_counts(lengths),
+            )
         return colors, zone_counts(lengths)
 
     def _loop_running(self) -> bool:
@@ -157,23 +179,40 @@ class ZonePaintHub:
             _LOGGER.debug("Zone painter stopped: %s", err)
         self.sender.close()
 
-    async def ensure_painting(self, device_id: str):
-        """Apply latest zone colours. Start the UDP loop if needed."""
+    async def apply(self, device_id: str):
+        """Apply current zone state: power if needed, run painter, paint now."""
         async with self._lock:
             device_ids = self.painting_device_ids()
             if not device_ids:
                 await self._stop_loop()
                 self.sender = ZoneSender()
-                self._powered.clear()
+                self._powered.discard(device_id)
+                self._last_logged.pop(device_id, None)
                 return
 
-            need_restart = (not self._loop_running()) or (
-                set(device_ids) != set(self.sender._devices)
-            )
-            if need_restart:
+            if (not self._loop_running()) or set(device_ids) != set(self.sender._devices):
                 await self._restart_locked(device_ids)
             elif device_id not in self._powered:
                 await self._power_one(device_id)
+
+            # Push one frame immediately so HA UI changes are not waiting on the tick.
+            await self.hass.async_add_executor_job(self._paint_now, device_id)
+
+    def _paint_now(self, device_id: str) -> None:
+        colors, counts = self._colors_for(device_id)
+        if not colors:
+            return
+        if device_id not in self.sender._devices:
+            return
+        if not self.sender._devices[device_id].get("session"):
+            # Negotiate once so the first HA click is not blank.
+            self.sender.negotiate(device_id)
+            for _ in range(20):
+                finished = self.sender.pump()
+                if finished == device_id:
+                    break
+                time.sleep(0.05)
+        self.sender.send_colors(device_id, colors, counts)
 
     async def refresh(self):
         async with self._lock:
@@ -182,6 +221,7 @@ class ZonePaintHub:
                 await self._stop_loop()
                 self.sender = ZoneSender()
                 self._powered.clear()
+                self._last_logged.clear()
                 return
             await self._restart_locked(ids)
 
@@ -201,15 +241,14 @@ class ZonePaintHub:
             return
         for did in device_ids:
             await self._power_one(did)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.25)
         self._run = self.entry.async_create_background_task(
             self.hass,
-            run_zone_loop(self.sender, device_ids, self._colors_for),
+            run_zone_loop(self.sender, device_ids, self._colors_for, interval=0.1),
             "battletron-zone-lights",
         )
 
     async def _power_one(self, device_id: str):
-        """Power the strip on over TCP once, then leave TCP closed for UDP."""
         if device_id in self._powered:
             return
         device = self._device(device_id)
@@ -224,7 +263,7 @@ class ZonePaintHub:
             if tuya.connected:
                 dp = int(power) if str(power).isdigit() else power
                 await tuya.set_dps({dp: True})
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.25)
                 self._powered.add(device_id)
                 _LOGGER.info("Zone strip %s powered", device_id[:8])
         except Exception as err:  # noqa: BLE001
@@ -234,11 +273,11 @@ class ZonePaintHub:
             await tuya.async_hold_tcp()
 
     async def stop_device(self, device_id: str):
-        state = self._ensure_state(device_id)
-        for slot in state:
+        for slot in self._ensure_state(device_id):
             slot["on"] = False
             slot["rgb"] = (0, 0, 0)
         self._powered.discard(device_id)
+        self._last_logged.pop(device_id, None)
         await self.refresh()
         tuya = _tuya_device(self.hass, self.entry, device_id)
         if tuya is not None:
@@ -250,10 +289,11 @@ class ZonePaintHub:
             await self._stop_loop()
             self.sender = ZoneSender()
             self._powered.clear()
+            self._last_logged.clear()
 
 
 class BattletronZoneLight(LightEntity):
-    """One segment of a Battletron strip — standard HS/RGB light."""
+    """One segment of a Battletron strip — standard RGB light."""
 
     _attr_has_entity_name = True
     _attr_supported_color_modes = {ColorMode.RGB}
@@ -267,6 +307,7 @@ class BattletronZoneLight(LightEntity):
         self._attr_unique_id = f"local_{device_id}_zone_{index}_light"
         self._attr_device_info = _device_info(device_id, device)
         self._is_on = False
+        # Full-brightness colour; brightness scales it for the wire.
         self._rgb = (255, 255, 255)
         self._brightness = 255
 
@@ -285,9 +326,9 @@ class BattletronZoneLight(LightEntity):
     def _hub(self) -> ZonePaintHub | None:
         return _hubs(self.hass).get(self._entry.entry_id)
 
-    def _paint_rgb(self) -> tuple[int, int, int]:
+    def _wire_rgb(self) -> tuple[int, int, int]:
         scale = (self._brightness or 255) / 255.0
-        return tuple(min(255, int(c * scale)) for c in self._rgb)
+        return tuple(min(255, max(0, int(c * scale))) for c in self._rgb)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if ATTR_RGB_COLOR in kwargs:
@@ -301,8 +342,8 @@ class BattletronZoneLight(LightEntity):
         self._is_on = True
         hub = self._hub()
         if hub:
-            hub.set_zone(self._device_id, self._index, is_on=True, rgb=self._paint_rgb())
-            await hub.ensure_painting(self._device_id)
+            hub.set_zone(self._device_id, self._index, is_on=True, rgb=self._wire_rgb())
+            await hub.apply(self._device_id)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -315,7 +356,10 @@ class BattletronZoneLight(LightEntity):
                 hub.zone_state(self._device_id, i).get("on")
                 for i in range(len(_zones(device)))
             )
-            if not still:
+            if still:
+                # Other zones still on — paint this slot black, keep painter.
+                await hub.apply(self._device_id)
+            else:
                 await hub.refresh()
                 tuya = _tuya_device(self.hass, self._entry, self._device_id)
                 if tuya is not None:
@@ -331,8 +375,10 @@ class BattletronZoneLight(LightEntity):
         slot = hub.zone_state(self._device_id, self._index)
         if slot.get("on"):
             self._is_on = True
-            self._rgb = tuple(slot.get("rgb") or (255, 255, 255))
-            self._brightness = max(self._rgb[0], self._rgb[1], self._rgb[2], 1)
+            rgb = tuple(slot.get("rgb") or (255, 255, 255))
+            peak = max(rgb[0], rgb[1], rgb[2], 1)
+            self._brightness = peak
+            self._rgb = tuple(min(255, int(round(c * 255 / peak))) for c in rgb)
 
 
 def zones_painting(hass, entry, device_id: str) -> bool:

@@ -34,8 +34,10 @@ def zone_counts(lengths_cm, segments=SEGMENTS):
 def color_payload(colors, counts):
     """Build the 0004 HSV payload. `colors` are RGB tuples in zone order."""
     slots = [_hsv_word(rgb) for rgb in list(colors)[:4]]
+    # Always pad unused slots with black — never clone the last colour.
+    black = _hsv_word((0, 0, 0))
     while len(slots) < 4:
-        slots.append(slots[-1])
+        slots.append(black)
     segments = sum(counts)
     mapping = "".join(f"{index + 1:02x}" * count for index, count in enumerate(counts))
     return "0004" + "".join(slots) + f"{segments:04x}" + mapping
