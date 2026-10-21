@@ -1,17 +1,15 @@
-"""Zone layout entities for Battletron strips.
+"""Zone layout for Battletron strips: add/remove zones and set lengths.
 
-Zones are configured here (length + edge). Colour is controlled by the
-standard zone ``light`` entities in ``zone_lights`` — not by Hyperion.
+Screen Edges (or HA / HomeKit) maps colours onto the zone *light* entities.
+There is no edge mapping here — that belongs in Screen Edges.
 """
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.components.select import SelectEntity
 from homeassistant.const import CONF_DEVICES, UnitOfLength
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import DOMAIN
-from .screen_layout import EDGES
 
 CONF_SCREEN_SYNC = "screen_sync"
 
@@ -30,7 +28,6 @@ def _zones(device):
 
 
 def _save(hass, entry):
-    """Persist zone layout without reloading the whole integration."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     skips = domain_data.setdefault("_skip_reload_entries", set())
     skips.add(entry.entry_id)
@@ -48,7 +45,7 @@ def _strip_devices(entry):
 
 
 def _drop_extra_zones(hass, entry):
-    """Remove stale zone / Hyperion screen-sync entities."""
+    """Remove stale zone / Hyperion / edge-select entities."""
     from homeassistant.helpers import entity_registry as er
 
     counts = {device_id: len(_zones(device)) for device_id, device in _strip_devices(entry)}
@@ -57,8 +54,8 @@ def _drop_extra_zones(hass, entry):
         unique_id = entity.unique_id or ""
         if not unique_id.startswith("local_"):
             continue
-        # Old Hyperion control surface — zone lights replaced these.
-        if unique_id.endswith("_screen_sync") or unique_id.endswith("_screen_server"):
+        # Removed control surfaces.
+        if unique_id.endswith(("_screen_sync", "_screen_server")) or unique_id.endswith("_edge"):
             registry.async_remove(entity.entity_id)
             continue
         marker = "_zone_"
@@ -73,7 +70,7 @@ def _drop_extra_zones(hass, entry):
 
 class ZoneLengthNumber(NumberEntity):
     _attr_has_entity_name = True
-    _attr_native_min_value = 0
+    _attr_native_min_value = 1
     _attr_native_max_value = 400
     _attr_native_step = 1
     _attr_mode = NumberMode.SLIDER
@@ -84,37 +81,15 @@ class ZoneLengthNumber(NumberEntity):
         self._device_id = device_id
         self._index = index
         zones = _zones(device)
-        self._attr_native_value = int(zones[index].get("cm") or 0)
+        self._attr_native_value = int(zones[index].get("cm") or 20)
         self._attr_name = f"Zone {index + 1} length"
         self._attr_unique_id = f"local_{device_id}_zone_{index}_cm"
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_set_native_value(self, value: float) -> None:
         zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
-        zones[self._index]["cm"] = int(value)
-        self._attr_native_value = int(value)
-        self.schedule_update_ha_state()
-        _save(self.hass, self._entry)
-
-
-class ZoneEdgeSelect(SelectEntity):
-    _attr_has_entity_name = True
-    _attr_options = list(EDGES)
-
-    def __init__(self, entry, device_id, device, index):
-        self._entry = entry
-        self._device_id = device_id
-        self._index = index
-        zones = _zones(device)
-        self._attr_current_option = zones[index].get("edge") or "top"
-        self._attr_name = f"Zone {index + 1} edge"
-        self._attr_unique_id = f"local_{device_id}_zone_{index}_edge"
-        self._attr_device_info = _device_info(device_id, device)
-
-    async def async_select_option(self, option: str) -> None:
-        zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
-        zones[self._index]["edge"] = option
-        self._attr_current_option = option
+        zones[self._index]["cm"] = max(1, int(value))
+        self._attr_native_value = zones[self._index]["cm"]
         self.schedule_update_ha_state()
         _save(self.hass, self._entry)
 
@@ -135,11 +110,8 @@ class AddZoneButton(ButtonEntity):
         zones = list(sync.get("zones") or [])
         if len(zones) >= 4:
             return
-        used = {zone.get("edge") for zone in zones}
-        edge = next((name for name in EDGES if name not in used), "bottom")
-        zones.append({"edge": edge, "cm": 20})
+        zones.append({"cm": 20})
         sync["zones"] = zones
-        # Clear obsolete Hyperion flags.
         sync.pop("enabled", None)
         sync.pop("server", None)
         device["screen_sync"] = sync
@@ -170,19 +142,17 @@ class RemoveZoneButton(ButtonEntity):
 
 
 async def async_add_numbers(hass, entry, async_add_entities):
-    entities = []
-    for device_id, device in _strip_devices(entry):
-        for index in range(len(_zones(device))):
-            entities.append(ZoneLengthNumber(entry, device_id, device, index))
+    entities = [
+        ZoneLengthNumber(entry, device_id, device, index)
+        for device_id, device in _strip_devices(entry)
+        for index in range(len(_zones(device)))
+    ]
     async_add_entities(entities)
 
 
 async def async_add_selects(hass, entry, async_add_entities):
-    entities = []
-    for device_id, device in _strip_devices(entry):
-        for index in range(len(_zones(device))):
-            entities.append(ZoneEdgeSelect(entry, device_id, device, index))
-    async_add_entities(entities)
+    """Edge selects removed — Screen Edges owns screen-edge mapping."""
+    async_add_entities([])
 
 
 async def async_add_buttons(hass, entry, async_add_entities):
@@ -196,12 +166,7 @@ async def async_add_buttons(hass, entry, async_add_entities):
     async_add_entities(entities)
 
 
-# Compatibility shims while light.py / coordinator migrate.
 def screen_sync_enabled(entry, device_id):
-    from .zone_lights import zones_painting
-
-    hass = getattr(entry, "hass", None)
-    # ConfigEntry has no hass; callers that need live state use zones_painting(hass,...).
     return False
 
 
@@ -218,5 +183,4 @@ async def async_start_hub(hass, entry):
 
 
 async def async_add_switches(hass, entry, async_add_entities):
-    """Screen sync switch removed — zone lights are the control surface."""
     async_add_entities([])

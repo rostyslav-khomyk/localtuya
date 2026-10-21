@@ -1,8 +1,7 @@
-"""Battletron strip chopped into standard HA color lights (one per zone).
+"""Battletron zones as normal HA colour lights.
 
-Each zone is a normal ``light`` entity (HS/RGB). Turning a zone on updates the
-shared UDP zone painter for that strip. Screen Edges (or HomeKit / Matter)
-only talks to these lights — never to Hyperion or a special sync switch.
+localtuya only splits the strip into zone lights + lengths. Colour comes from
+HA ``light.turn_on`` (UI, Screen Edges, HomeKit, …) and is painted over UDP.
 """
 
 from __future__ import annotations
@@ -40,6 +39,11 @@ def _zones(device: dict) -> list[dict]:
     return list(_sync(device).get(CONF_ZONES) or [])
 
 
+def device_has_zones(entry, device_id: str) -> bool:
+    device = (entry.data.get(CONF_DEVICES) or {}).get(device_id) or {}
+    return len(_zones(device)) > 0
+
+
 def _device_info(device_id: str, device: dict) -> DeviceInfo:
     name = device.get("friendly_name") or device.get("name") or device_id
     return DeviceInfo(identifiers={(DOMAIN, f"local_{device_id}")}, name=name)
@@ -59,15 +63,15 @@ def _tuya_device(hass, entry, device_id: str):
     return None
 
 
-def _light_dps(device: dict):
+def _power_dp(device: dict):
     for entity in device.get("entities") or []:
         if str(entity.get("platform", "")).lower() == "light":
-            return entity.get("id"), entity.get("color_mode")
-    return None, None
+            return entity.get("id")
+    return None
 
 
 class ZonePaintHub:
-    """One UDP painter for the config entry. Several strips share port 40001."""
+    """Shared UDP painter. One socket on :40001 for every strip with zones on."""
 
     def __init__(self, hass, entry):
         self.hass = hass
@@ -75,7 +79,8 @@ class ZonePaintHub:
         self.sender = ZoneSender()
         self._run = None
         self._lock = asyncio.Lock()
-        # device_id -> list of {"on": bool, "rgb": (r,g,b)} aligned with zones[]
+        self._powered: set[str] = set()
+        # device_id -> [{"on": bool, "rgb": (r,g,b)}, ...]
         self._state: dict[str, list[dict]] = {}
 
     def _device(self, device_id: str) -> dict | None:
@@ -92,45 +97,41 @@ class ZonePaintHub:
 
     def set_zone(self, device_id: str, index: int, *, is_on: bool, rgb: tuple[int, int, int]):
         state = self._ensure_state(device_id)
-        if index < 0 or index >= len(state):
-            return
-        state[index] = {"on": is_on, "rgb": tuple(int(c) for c in rgb[:3])}
+        if 0 <= index < len(state):
+            state[index] = {"on": is_on, "rgb": (int(rgb[0]), int(rgb[1]), int(rgb[2]))}
 
     def zone_state(self, device_id: str, index: int) -> dict:
         state = self._ensure_state(device_id)
-        if index < 0 or index >= len(state):
-            return {"on": False, "rgb": (0, 0, 0)}
-        return state[index]
+        if 0 <= index < len(state):
+            return state[index]
+        return {"on": False, "rgb": (0, 0, 0)}
 
     def painting_device_ids(self) -> list[str]:
-        active = []
+        out = []
         for device_id, device in (self.entry.data.get(CONF_DEVICES) or {}).items():
             if not _zones(device):
                 continue
-            state = self._ensure_state(device_id)
-            if not any(slot.get("on") for slot in state):
+            if not any(s.get("on") for s in self._ensure_state(device_id)):
                 continue
             if device.get(CONF_HOST) and device.get(CONF_LOCAL_KEY):
-                active.append(device_id)
-        return active
+                out.append(device_id)
+        return out
 
     def _colors_for(self, device_id: str):
         device = self._device(device_id)
         if not device:
             return None, None
-        all_zones = _zones(device)
-        if not all_zones:
-            return None, None
+        zones = _zones(device)
         state = self._ensure_state(device_id)
         colors = []
         lengths = []
         any_on = False
-        for index, zone in enumerate(all_zones):
+        for index, zone in enumerate(zones):
             cm = int(zone.get("cm") or 0)
             if cm <= 0:
                 continue
             slot = state[index] if index < len(state) else {"on": False, "rgb": (0, 0, 0)}
-            rgb = slot["rgb"] if slot.get("on") else (0, 0, 0)
+            rgb = tuple(slot["rgb"]) if slot.get("on") else (0, 0, 0)
             if slot.get("on"):
                 any_on = True
             colors.append(rgb)
@@ -152,72 +153,92 @@ class ZonePaintHub:
             await task
         except asyncio.CancelledError:
             pass
-        except Exception as err:  # noqa: BLE001 — prior painter may have crashed
-            _LOGGER.debug("Zone painter stopped with %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zone painter stopped: %s", err)
         self.sender.close()
 
-    async def ensure_painting(self, device_id: str, *, power: bool = False):
-        """Start or keep the UDP painter. Colour updates do not restart it."""
+    async def ensure_painting(self, device_id: str):
+        """Apply latest zone colours. Start the UDP loop if needed."""
         async with self._lock:
             device_ids = self.painting_device_ids()
             if not device_ids:
                 await self._stop_loop()
                 self.sender = ZoneSender()
+                self._powered.clear()
                 return
-            if self._loop_running() and device_id in self.sender._devices:
-                return
-            await self._restart_locked(power=power or device_id in device_ids)
 
-    async def refresh(self, *, power: bool = False):
-        """Rebuild the painter from current zone light state."""
+            need_restart = (not self._loop_running()) or (
+                set(device_ids) != set(self.sender._devices)
+            )
+            if need_restart:
+                await self._restart_locked(device_ids)
+            elif device_id not in self._powered:
+                await self._power_one(device_id)
+
+    async def refresh(self):
         async with self._lock:
-            await self._restart_locked(power=power)
+            ids = self.painting_device_ids()
+            if not ids:
+                await self._stop_loop()
+                self.sender = ZoneSender()
+                self._powered.clear()
+                return
+            await self._restart_locked(ids)
 
-    async def _restart_locked(self, *, power: bool = False):
+    async def _restart_locked(self, device_ids: list[str]):
         await self._stop_loop()
         await asyncio.sleep(0.1)
         self.sender = ZoneSender()
-        device_ids = self.painting_device_ids()
         for did in device_ids:
             device = self._device(did)
             if not device:
                 continue
-            key = device.get(CONF_LOCAL_KEY)
-            host = device.get(CONF_HOST)
+            key, host = device.get(CONF_LOCAL_KEY), device.get(CONF_HOST)
             if key and host:
                 self.sender.add(did, key, host)
         device_ids = list(self.sender._devices)
         if not device_ids:
             return
-        if power:
-            await self._power_devices(device_ids)
-            await asyncio.sleep(0.4)
-        else:
-            for did in device_ids:
-                tuya = _tuya_device(self.hass, self.entry, did)
-                if tuya is not None:
-                    await tuya.async_hold_tcp()
+        for did in device_ids:
+            await self._power_one(did)
+        await asyncio.sleep(0.3)
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
             "battletron-zone-lights",
         )
 
-    async def _power_devices(self, device_ids: list[str]):
-        for device_id in device_ids:
-            device = self._device(device_id)
-            tuya = _tuya_device(self.hass, self.entry, device_id)
-            if tuya is None or device is None:
-                continue
-            power, mode = _light_dps(device)
-            await tuya.async_power_for_zones(power, mode)
+    async def _power_one(self, device_id: str):
+        """Power the strip on over TCP once, then leave TCP closed for UDP."""
+        if device_id in self._powered:
+            return
+        device = self._device(device_id)
+        tuya = _tuya_device(self.hass, self.entry, device_id)
+        power = _power_dp(device) if device else None
+        if tuya is None or power is None:
+            return
+        try:
+            tuya._zone_tcp_window = True
+            tuya._hold_tcp = False
+            await tuya.async_connect()
+            if tuya.connected:
+                dp = int(power) if str(power).isdigit() else power
+                await tuya.set_dps({dp: True})
+                await asyncio.sleep(0.3)
+                self._powered.add(device_id)
+                _LOGGER.info("Zone strip %s powered", device_id[:8])
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not power zone strip %s: %s", device_id[:8], err)
+        finally:
+            tuya._zone_tcp_window = False
+            await tuya.async_hold_tcp()
 
     async def stop_device(self, device_id: str):
-        """Parent strip light took over — clear zones and release TCP."""
         state = self._ensure_state(device_id)
         for slot in state:
             slot["on"] = False
             slot["rgb"] = (0, 0, 0)
+        self._powered.discard(device_id)
         await self.refresh()
         tuya = _tuya_device(self.hass, self.entry, device_id)
         if tuya is not None:
@@ -228,26 +249,25 @@ class ZonePaintHub:
         async with self._lock:
             await self._stop_loop()
             self.sender = ZoneSender()
+            self._powered.clear()
 
 
 class BattletronZoneLight(LightEntity):
-    """One colour segment of a Battletron strip."""
+    """One segment of a Battletron strip — standard HS/RGB light."""
 
     _attr_has_entity_name = True
-    _attr_supported_color_modes = {ColorMode.HS}
-    _attr_color_mode = ColorMode.HS
+    _attr_supported_color_modes = {ColorMode.RGB}
+    _attr_color_mode = ColorMode.RGB
 
     def __init__(self, entry, device_id: str, device: dict, index: int):
         self._entry = entry
         self._device_id = device_id
         self._index = index
-        zones = _zones(device)
-        edge = (zones[index].get("edge") if index < len(zones) else None) or f"zone {index + 1}"
-        self._attr_name = f"Zone {index + 1} ({edge})"
+        self._attr_name = f"Zone {index + 1}"
         self._attr_unique_id = f"local_{device_id}_zone_{index}_light"
         self._attr_device_info = _device_info(device_id, device)
         self._is_on = False
-        self._hs = (0.0, 0.0)
+        self._rgb = (255, 255, 255)
         self._brightness = 255
 
     @property
@@ -259,35 +279,30 @@ class BattletronZoneLight(LightEntity):
         return self._brightness if self._is_on else None
 
     @property
-    def hs_color(self) -> tuple[float, float] | None:
-        return self._hs if self._is_on else None
+    def rgb_color(self) -> tuple[int, int, int] | None:
+        return self._rgb if self._is_on else None
 
     def _hub(self) -> ZonePaintHub | None:
         return _hubs(self.hass).get(self._entry.entry_id)
 
-    def _rgb(self) -> tuple[int, int, int]:
-        r, g, b = color_util.color_hs_to_RGB(self._hs[0], self._hs[1])
+    def _paint_rgb(self) -> tuple[int, int, int]:
         scale = (self._brightness or 255) / 255.0
-        return (int(r * scale), int(g * scale), int(b * scale))
+        return tuple(min(255, int(c * scale)) for c in self._rgb)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        if ATTR_HS_COLOR in kwargs:
-            hs = kwargs[ATTR_HS_COLOR]
-            self._hs = (float(hs[0]), float(hs[1]))
-        if ATTR_BRIGHTNESS in kwargs:
-            self._brightness = int(kwargs[ATTR_BRIGHTNESS])
         if ATTR_RGB_COLOR in kwargs:
             rgb = kwargs[ATTR_RGB_COLOR]
-            self._hs = color_util.color_RGB_to_hs(rgb[0], rgb[1], rgb[2])
-            self._brightness = max(int(rgb[0]), int(rgb[1]), int(rgb[2]), 1)
-        was_off = not self._is_on
+            self._rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        elif ATTR_HS_COLOR in kwargs:
+            hs = kwargs[ATTR_HS_COLOR]
+            self._rgb = color_util.color_hs_to_RGB(float(hs[0]), float(hs[1]))
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = int(kwargs[ATTR_BRIGHTNESS])
         self._is_on = True
         hub = self._hub()
-        if hub is None:
-            _LOGGER.warning("Zone hub is not ready for %s", self._device_id)
-        else:
-            hub.set_zone(self._device_id, self._index, is_on=True, rgb=self._rgb())
-            await hub.ensure_painting(self._device_id, power=was_off)
+        if hub:
+            hub.set_zone(self._device_id, self._index, is_on=True, rgb=self._paint_rgb())
+            await hub.ensure_painting(self._device_id)
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -316,34 +331,29 @@ class BattletronZoneLight(LightEntity):
         slot = hub.zone_state(self._device_id, self._index)
         if slot.get("on"):
             self._is_on = True
-            rgb = slot.get("rgb") or (0, 0, 0)
-            self._hs = color_util.color_RGB_to_hs(*rgb)
-            self._brightness = max(rgb[0], rgb[1], rgb[2], 1)
+            self._rgb = tuple(slot.get("rgb") or (255, 255, 255))
+            self._brightness = max(self._rgb[0], self._rgb[1], self._rgb[2], 1)
 
 
 def zones_painting(hass, entry, device_id: str) -> bool:
     hub = _hubs(hass).get(entry.entry_id)
     if not hub:
         return False
-    try:
-        state = hub._ensure_state(device_id)
-    except Exception:  # noqa: BLE001
-        return False
-    return any(slot.get("on") for slot in state)
+    return any(s.get("on") for s in hub._ensure_state(device_id))
 
 
 async def async_release_zones(device) -> None:
-    """Parent strip light is taking over."""
     hub = _hubs(device.hass).get(device._entry.entry_id)
     if hub:
         await hub.stop_device(device.id)
 
 
 async def async_add_zone_lights(hass, entry, async_add_entities):
-    entities = []
-    for device_id, device in entry.data.get(CONF_DEVICES, {}).items():
-        for index in range(len(_zones(device))):
-            entities.append(BattletronZoneLight(entry, device_id, device, index))
+    entities = [
+        BattletronZoneLight(entry, device_id, device, index)
+        for device_id, device in entry.data.get(CONF_DEVICES, {}).items()
+        for index in range(len(_zones(device)))
+    ]
     if entities:
         async_add_entities(entities)
 

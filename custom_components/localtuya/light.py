@@ -302,6 +302,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         return attributes
 
+    def _has_zones(self) -> bool:
+        from .zone_lights import device_has_zones
+
+        return device_has_zones(self._device._entry, self._device.id)
+
     def _zones_active(self):
         from .zone_lights import zones_painting
 
@@ -309,19 +314,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     @property
     def available(self) -> bool:
-        """Stay usable while zone lights hold the local connection closed."""
-        if self._zones_active():
-            return True
+        """Parent strip light is disabled once the strip is split into zones."""
+        if self._has_zones():
+            return False
         return bool(super().available)
 
     @property
     def is_on(self):
-        """Check if Tuya light is on.
-
-        Zone lights turn this switch off so both do not drive the strip.
-        Turning this switch on releases the zones. Both may stay off.
-        """
-        if self._zones_active():
+        """Check if Tuya light is on."""
+        if self._has_zones() or self._zones_active():
             return False
         return self._state
 
@@ -548,6 +549,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn on or control the light."""
+        if self._has_zones():
+            # Zones own this strip — use the Zone N lights instead.
+            return
         released_sync = False
         if self._zones_active():
             from .zone_lights import async_release_zones
