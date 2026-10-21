@@ -129,7 +129,7 @@ class ZonePaintHub:
                 out.append(device_id)
         return out
 
-    def _colors_for(self, device_id: str):
+    def _colors_for(self, device_id: str, *, allow_all_off: bool = False):
         device = self._device(device_id)
         if not device:
             return None, None
@@ -149,7 +149,7 @@ class ZonePaintHub:
                 any_on = True
             colors.append(rgb)
             lengths.append(cm)
-        if not any_on or not colors:
+        if not colors or (not any_on and not allow_all_off):
             return None, None
         key = (device_id, tuple(colors), tuple(lengths))
         if self._last_logged.get(device_id) != key:
@@ -183,12 +183,28 @@ class ZonePaintHub:
         """Apply current zone state: power if needed, run painter, paint now."""
         async with self._lock:
             device_ids = self.painting_device_ids()
-            if not device_ids:
-                await self._stop_loop()
-                self.sender = ZoneSender()
+            if device_id not in device_ids:
+                # All zones off for this strip — black out, then drop from painter.
+                await self.hass.async_add_executor_job(
+                    self._paint_now, device_id, True
+                )
+                await self._power_off(device_id)
+                remaining = [d for d in self.sender._devices if d != device_id and d in device_ids]
+                if not device_ids:
+                    await self._stop_loop()
+                    self.sender = ZoneSender()
+                elif set(remaining) != set(self.sender._devices):
+                    await self._restart_locked(device_ids)
                 self._powered.discard(device_id)
                 self._last_logged.pop(device_id, None)
                 return
+
+            dropped = [d for d in self.sender._devices if d not in device_ids]
+            for did in dropped:
+                await self.hass.async_add_executor_job(self._paint_now, did, True)
+                await self._power_off(did)
+                self._powered.discard(did)
+                self._last_logged.pop(did, None)
 
             if (not self._loop_running()) or set(device_ids) != set(self.sender._devices):
                 await self._restart_locked(device_ids)
@@ -196,10 +212,10 @@ class ZonePaintHub:
                 await self._power_one(device_id)
 
             # Push one frame immediately so HA UI changes are not waiting on the tick.
-            await self.hass.async_add_executor_job(self._paint_now, device_id)
+            await self.hass.async_add_executor_job(self._paint_now, device_id, False)
 
-    def _paint_now(self, device_id: str) -> None:
-        colors, counts = self._colors_for(device_id)
+    def _paint_now(self, device_id: str, allow_all_off: bool = False) -> None:
+        colors, counts = self._colors_for(device_id, allow_all_off=allow_all_off)
         if not colors:
             return
         if device_id not in self.sender._devices:
@@ -213,6 +229,11 @@ class ZonePaintHub:
                     break
                 time.sleep(0.05)
         self.sender.send_colors(device_id, colors, counts)
+        if allow_all_off:
+            # A few more black frames so the strip does not keep the last colour.
+            for _ in range(3):
+                time.sleep(0.05)
+                self.sender.send_colors(device_id, colors, counts)
 
     async def refresh(self):
         async with self._lock:
@@ -272,17 +293,34 @@ class ZonePaintHub:
             tuya._zone_tcp_window = False
             await tuya.async_hold_tcp()
 
+    async def _power_off(self, device_id: str):
+        """Turn the physical strip off so an all-off zone set stays dark."""
+        device = self._device(device_id)
+        tuya = _tuya_device(self.hass, self.entry, device_id)
+        power = _power_dp(device) if device else None
+        if tuya is None or power is None:
+            return
+        try:
+            tuya._zone_tcp_window = True
+            tuya._hold_tcp = False
+            await tuya.async_connect()
+            if tuya.connected:
+                dp = int(power) if str(power).isdigit() else power
+                await tuya.set_dps({dp: False})
+                await asyncio.sleep(0.15)
+                _LOGGER.info("Zone strip %s powered off", device_id[:8])
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not power off zone strip %s: %s", device_id[:8], err)
+        finally:
+            tuya._zone_tcp_window = False
+            tuya._pending_status = {}
+            await tuya.async_release_tcp()
+
     async def stop_device(self, device_id: str):
         for slot in self._ensure_state(device_id):
             slot["on"] = False
             slot["rgb"] = (0, 0, 0)
-        self._powered.discard(device_id)
-        self._last_logged.pop(device_id, None)
-        await self.refresh()
-        tuya = _tuya_device(self.hass, self.entry, device_id)
-        if tuya is not None:
-            tuya._pending_status = {}
-            await tuya.async_release_tcp()
+        await self.apply(device_id)
 
     async def stop(self):
         async with self._lock:
@@ -351,20 +389,8 @@ class BattletronZoneLight(LightEntity):
         hub = self._hub()
         if hub:
             hub.set_zone(self._device_id, self._index, is_on=False, rgb=(0, 0, 0))
-            device = (self._entry.data.get(CONF_DEVICES) or {}).get(self._device_id) or {}
-            still = any(
-                hub.zone_state(self._device_id, i).get("on")
-                for i in range(len(_zones(device)))
-            )
-            if still:
-                # Other zones still on — paint this slot black, keep painter.
-                await hub.apply(self._device_id)
-            else:
-                await hub.refresh()
-                tuya = _tuya_device(self.hass, self._entry, self._device_id)
-                if tuya is not None:
-                    tuya._pending_status = {}
-                    await tuya.async_release_tcp()
+            # apply() paints black for this slot (or black+power-off if last zone).
+            await hub.apply(self._device_id)
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
