@@ -404,7 +404,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             if power_dp is not None and self.connected:
                 dp = int(power_dp) if str(power_dp).isdigit() else power_dp
                 await self.set_dp(True, dp)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
+                self.info("Strip powered for screen sync")
+            elif power_dp is not None:
+                self.warning("Could not reach the strip to power it for screen sync")
         except Exception as err:
             self.warning(f"Could not power the strip for screen sync: {err}")
         finally:
@@ -704,6 +707,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
         # If it disconnects unexpectedly.
         if self.is_closing:
+            return
+
+        # Screen sync owns the strip. Do not reopen the color link.
+        if self._hold_tcp or self._screen_sync_blocks_tcp():
             return
 
         if self._task_reconnect is None:

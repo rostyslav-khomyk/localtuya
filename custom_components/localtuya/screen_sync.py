@@ -92,21 +92,23 @@ class ScreenHub:
         device_ids = list(self.sender._devices)
         if not device_ids:
             return
-        # Power first. Opening the color link after a zone session starts
-        # makes the strip drop the zone link and stay dark.
-        for dev_id in device_ids:
-            device = self.entry.data[CONF_DEVICES][dev_id]
-            tuya = _tuya_device(self.hass, self.entry, dev_id)
-            if tuya is not None:
-                await tuya.async_power_for_zones(_light_power_dp(device))
+        await self._power_devices(device_ids)
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
             "battletron-zones",
         )
 
-    async def restart_zones(self):
-        """Apply a server or zone change without dropping the screen connection."""
+    async def _power_devices(self, device_ids):
+        """Power each strip before the zone link. Never open TCP during painting."""
+        for dev_id in device_ids:
+            device = self.entry.data[CONF_DEVICES][dev_id]
+            tuya = _tuya_device(self.hass, self.entry, dev_id)
+            if tuya is not None:
+                await tuya.async_power_for_zones(_light_power_dp(device))
+
+    async def restart_zones(self, *, power: bool = False):
+        """Restart zone painting. Set power=True only when a strip may be off."""
         if self._run:
             self._run.cancel()
             self._run = None
@@ -115,11 +117,8 @@ class ScreenHub:
         if not device_ids:
             self.sender.close()
             return
-        for dev_id in device_ids:
-            device = self.entry.data[CONF_DEVICES][dev_id]
-            tuya = _tuya_device(self.hass, self.entry, dev_id)
-            if tuya is not None:
-                await tuya.async_power_for_zones(_light_power_dp(device))
+        if power:
+            await self._power_devices(device_ids)
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
@@ -253,7 +252,7 @@ class ScreenSyncSwitch(SwitchEntity):
         return bool(_sync(device).get("enabled"))
 
     async def async_turn_on(self, **kwargs):
-        """Power the strip, close the color link, then start zone painting."""
+        """Power this strip, close its color link, then start zone painting."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         sync["enabled"] = True
@@ -264,7 +263,8 @@ class ScreenSyncSwitch(SwitchEntity):
             await tuya.async_power_for_zones(_light_power_dp(device))
         hub = _hubs(self.hass).get(self._entry.entry_id)
         if hub:
-            await hub.restart_zones()
+            # Other strips are already powered. Do not reopen their color link.
+            await hub.restart_zones(power=False)
         self.schedule_update_ha_state()
         _poke(tuya)
 
