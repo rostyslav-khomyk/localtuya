@@ -297,16 +297,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     update_localkey = True
 
         # Connect and configure the entities, at this point the device should be ready to get commands.
-        if self.connected and self._screen_sync_blocks_tcp():
+        if self.connected and self._screen_sync_blocks_tcp() and not self._zone_tcp_window:
             await self.abort_connect()
         if self.connected and not self.is_closing:
             self.debug(f"Success: connected to: {host}", force=True)
             # Attempt to restore status for all entities that need to first set
             # the DPS value before the device will respond with status.
-            for entity in self._entities:
-                restore = getattr(entity, "restore_state_when_connected", None)
-                if restore is not None:
-                    await restore()
+            if not self._zone_tcp_window:
+                for entity in self._entities:
+                    restore = getattr(entity, "restore_state_when_connected", None)
+                    if restore is not None:
+                        await restore()
 
             if self._unsub_new_entity is None:
 
@@ -387,6 +388,28 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._hold_tcp = False
         self._pending_status = {}
         await self.async_connect()
+
+    async def async_power_for_zones(self, power_dp) -> None:
+        """Turn the strip on, then drop the color link so zone frames can paint.
+
+        Must run before the zone link starts. Opening this color link while
+        zone frames are flowing makes the strip drop the zone session and
+        stay dark. The saved color is left alone.
+        """
+        self._zone_tcp_window = True
+        self._hold_tcp = False
+        self._pending_status = {}
+        try:
+            await self.async_connect()
+            if power_dp is not None and self.connected:
+                dp = int(power_dp) if str(power_dp).isdigit() else power_dp
+                await self.set_dp(True, dp)
+                await asyncio.sleep(0.5)
+        except Exception as err:
+            self.warning(f"Could not power the strip for screen sync: {err}")
+        finally:
+            self._zone_tcp_window = False
+            await self.async_hold_tcp()
 
     async def check_connection(self):
         """Ensure that the device is not still connecting; if it is, wait for it."""

@@ -92,6 +92,13 @@ class ScreenHub:
         device_ids = list(self.sender._devices)
         if not device_ids:
             return
+        # Power first. Opening the color link after a zone session starts
+        # makes the strip drop the zone link and stay dark.
+        for dev_id in device_ids:
+            device = self.entry.data[CONF_DEVICES][dev_id]
+            tuya = _tuya_device(self.hass, self.entry, dev_id)
+            if tuya is not None:
+                await tuya.async_power_for_zones(_light_power_dp(device))
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
@@ -108,6 +115,11 @@ class ScreenHub:
         if not device_ids:
             self.sender.close()
             return
+        for dev_id in device_ids:
+            device = self.entry.data[CONF_DEVICES][dev_id]
+            tuya = _tuya_device(self.hass, self.entry, dev_id)
+            if tuya is not None:
+                await tuya.async_power_for_zones(_light_power_dp(device))
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
@@ -200,6 +212,13 @@ async def _persist_and_reload(hass, entry):
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _light_power_dp(device):
+    for entity in device.get("entities") or []:
+        if str(entity.get("platform", "")).lower() == "light":
+            return entity.get("id")
+    return None
+
+
 def _poke(tuya):
     """Ask the strip's entities to read the switches again."""
     if tuya is None:
@@ -234,7 +253,7 @@ class ScreenSyncSwitch(SwitchEntity):
         return bool(_sync(device).get("enabled"))
 
     async def async_turn_on(self, **kwargs):
-        """Close the color link and follow the screen. The saved color stays stored."""
+        """Power the strip, close the color link, then start zone painting."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         sync["enabled"] = True
@@ -242,7 +261,7 @@ class ScreenSyncSwitch(SwitchEntity):
         _save(self.hass, self._entry)
         tuya = _tuya_device(self.hass, self._entry, self._device_id)
         if tuya is not None:
-            await tuya.async_hold_tcp()
+            await tuya.async_power_for_zones(_light_power_dp(device))
         hub = _hubs(self.hass).get(self._entry.entry_id)
         if hub:
             await hub.restart_zones()
