@@ -139,13 +139,15 @@ class ZoneSender:
         raise last_err
 
     def negotiate(self, device_id: str) -> None:
-        dev = self._devices[device_id]
+        dev = self._devices.get(device_id)
+        if not dev:
+            return
         plain = b"\x00\x00\x00\x00" + dev["token"] + dev["rnd"]
         self._send(dev, NEGOTIATE, plain, FIXED_KEY)
 
     def send_colors(self, device_id: str, colors, counts) -> None:
-        dev = self._devices[device_id]
-        if not dev["session"]:
+        dev = self._devices.get(device_id)
+        if not dev or not dev["session"]:
             return
         plain = bytes.fromhex(color_payload(colors, counts))
         self._send(dev, COLORS, plain, dev["session"])
@@ -222,10 +224,12 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
     last_negotiate = 0.0
     try:
         while not stop.is_set():
+            if not sender._devices:
+                break
             now = time.monotonic()
             if now - last_negotiate >= 1.0:
                 for device_id in device_ids:
-                    if device_id not in ready:
+                    if device_id not in ready and device_id in sender._devices:
                         sender.negotiate(device_id)
                 last_negotiate = now
             finished = sender.pump()
@@ -233,6 +237,8 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
                 ready.add(finished)
                 _LOGGER.info("Zone session ready for %s", finished)
             for device_id in list(ready):
+                if device_id not in sender._devices:
+                    continue
                 colors, counts = color_fn(device_id)
                 if not colors:
                     continue
@@ -245,6 +251,8 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
                     )
                 sender.send_colors(device_id, colors, counts)
             stop.wait(interval)
+    except Exception:
+        _LOGGER.exception("Zone painter thread crashed")
     finally:
         # Leave socket close to the async caller so restart can wait on it.
         pass
@@ -259,11 +267,15 @@ async def run_zone_loop(sender: ZoneSender, device_ids, color_fn, interval=0.125
     )
     try:
         await task
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _LOGGER.exception("Zone painter task failed")
     finally:
         stop.set()
         if not task.done():
             try:
-                await asyncio.wait_for(task, timeout=3)
+                await asyncio.wait_for(asyncio.shield(task), timeout=3)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
         sender.close()

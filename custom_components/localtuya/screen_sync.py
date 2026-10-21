@@ -48,15 +48,21 @@ def _strip_devices(entry):
 
 
 def _drop_extra_zones(hass, entry):
-    """Remove zone entities that are no longer part of a strip."""
+    """Remove stale zone / Hyperion screen-sync entities."""
     from homeassistant.helpers import entity_registry as er
 
     counts = {device_id: len(_zones(device)) for device_id, device in _strip_devices(entry)}
     registry = er.async_get(hass)
     for entity in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
         unique_id = entity.unique_id or ""
+        if not unique_id.startswith("local_"):
+            continue
+        # Old Hyperion control surface — zone lights replaced these.
+        if unique_id.endswith("_screen_sync") or unique_id.endswith("_screen_server"):
+            registry.async_remove(entity.entity_id)
+            continue
         marker = "_zone_"
-        if marker not in unique_id or not unique_id.startswith("local_"):
+        if marker not in unique_id:
             continue
         head, _, tail = unique_id.partition(marker)
         device_id = head[len("local_") :]

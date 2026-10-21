@@ -29,7 +29,6 @@ from .screen_layout import zone_counts
 _LOGGER = logging.getLogger(__name__)
 
 CONF_ZONES = "zones"
-# Kept under screen_sync in entry data for migration; zones[] is what matters.
 CONF_SCREEN_SYNC = "screen_sync"
 
 
@@ -75,12 +74,16 @@ class ZonePaintHub:
         self.entry = entry
         self.sender = ZoneSender()
         self._run = None
+        self._lock = asyncio.Lock()
         # device_id -> list of {"on": bool, "rgb": (r,g,b)} aligned with zones[]
         self._state: dict[str, list[dict]] = {}
 
+    def _device(self, device_id: str) -> dict | None:
+        return (self.entry.data.get(CONF_DEVICES) or {}).get(device_id)
+
     def _ensure_state(self, device_id: str) -> list[dict]:
-        device = self.entry.data[CONF_DEVICES][device_id]
-        zones = _zones(device)
+        device = self._device(device_id)
+        zones = _zones(device) if device else []
         current = self._state.get(device_id)
         if current is None or len(current) != len(zones):
             current = [{"on": False, "rgb": (0, 0, 0)} for _ in zones]
@@ -101,26 +104,24 @@ class ZonePaintHub:
 
     def painting_device_ids(self) -> list[str]:
         active = []
-        for device_id, device in self.entry.data.get(CONF_DEVICES, {}).items():
-            zones = _zones(device)
-            if not zones:
+        for device_id, device in (self.entry.data.get(CONF_DEVICES) or {}).items():
+            if not _zones(device):
                 continue
             state = self._ensure_state(device_id)
-            if any(slot.get("on") for slot in state):
-                host = device.get(CONF_HOST)
-                key = device.get(CONF_LOCAL_KEY)
-                if host and key:
-                    active.append(device_id)
+            if not any(slot.get("on") for slot in state):
+                continue
+            if device.get(CONF_HOST) and device.get(CONF_LOCAL_KEY):
+                active.append(device_id)
         return active
 
     def _colors_for(self, device_id: str):
-        device = self.entry.data[CONF_DEVICES][device_id]
-        zones = [z for z in _zones(device) if int(z.get("cm") or 0) > 0]
-        if not zones:
+        device = self._device(device_id)
+        if not device:
+            return None, None
+        all_zones = _zones(device)
+        if not all_zones:
             return None, None
         state = self._ensure_state(device_id)
-        # Align state slots with full zone list (including 0 cm skipped for paint)
-        all_zones = _zones(device)
         colors = []
         lengths = []
         any_on = False
@@ -141,33 +142,51 @@ class ZonePaintHub:
     def _loop_running(self) -> bool:
         return self._run is not None and not self._run.done()
 
+    async def _stop_loop(self) -> None:
+        task = self._run
+        self._run = None
+        if not task:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:  # noqa: BLE001 — prior painter may have crashed
+            _LOGGER.debug("Zone painter stopped with %s", err)
+        self.sender.close()
+
     async def ensure_painting(self, device_id: str, *, power: bool = False):
         """Start or keep the UDP painter. Colour updates do not restart it."""
-        device_ids = self.painting_device_ids()
-        if not device_ids:
-            await self.refresh()
-            return
-        if self._loop_running() and device_id in self.sender._devices:
-            # Live colour changes — the loop already reads _colors_for each tick.
-            return
-        await self.refresh(power=power or device_id in device_ids)
+        async with self._lock:
+            device_ids = self.painting_device_ids()
+            if not device_ids:
+                await self._stop_loop()
+                self.sender = ZoneSender()
+                return
+            if self._loop_running() and device_id in self.sender._devices:
+                return
+            await self._restart_locked(power=power or device_id in device_ids)
 
     async def refresh(self, *, power: bool = False):
         """Rebuild the painter from current zone light state."""
-        if self._run:
-            self._run.cancel()
-            try:
-                await self._run
-            except asyncio.CancelledError:
-                pass
-            self._run = None
-        self.sender.close()
-        await asyncio.sleep(0.15)
+        async with self._lock:
+            await self._restart_locked(power=power)
+
+    async def _restart_locked(self, *, power: bool = False):
+        await self._stop_loop()
+        await asyncio.sleep(0.1)
         self.sender = ZoneSender()
         device_ids = self.painting_device_ids()
         for did in device_ids:
-            device = self.entry.data[CONF_DEVICES][did]
-            self.sender.add(did, device[CONF_LOCAL_KEY], device[CONF_HOST])
+            device = self._device(did)
+            if not device:
+                continue
+            key = device.get(CONF_LOCAL_KEY)
+            host = device.get(CONF_HOST)
+            if key and host:
+                self.sender.add(did, key, host)
+        device_ids = list(self.sender._devices)
         if not device_ids:
             return
         if power:
@@ -186,9 +205,9 @@ class ZonePaintHub:
 
     async def _power_devices(self, device_ids: list[str]):
         for device_id in device_ids:
-            device = self.entry.data[CONF_DEVICES][device_id]
+            device = self._device(device_id)
             tuya = _tuya_device(self.hass, self.entry, device_id)
-            if tuya is None:
+            if tuya is None or device is None:
                 continue
             power, mode = _light_dps(device)
             await tuya.async_power_for_zones(power, mode)
@@ -206,14 +225,9 @@ class ZonePaintHub:
             await tuya.async_release_tcp()
 
     async def stop(self):
-        if self._run:
-            self._run.cancel()
-            try:
-                await self._run
-            except asyncio.CancelledError:
-                pass
-            self._run = None
-        self.sender.close()
+        async with self._lock:
+            await self._stop_loop()
+            self.sender = ZoneSender()
 
 
 class BattletronZoneLight(LightEntity):
@@ -269,7 +283,9 @@ class BattletronZoneLight(LightEntity):
         was_off = not self._is_on
         self._is_on = True
         hub = self._hub()
-        if hub:
+        if hub is None:
+            _LOGGER.warning("Zone hub is not ready for %s", self._device_id)
+        else:
             hub.set_zone(self._device_id, self._index, is_on=True, rgb=self._rgb())
             await hub.ensure_painting(self._device_id, power=was_off)
         self.async_write_ha_state()
@@ -279,14 +295,12 @@ class BattletronZoneLight(LightEntity):
         hub = self._hub()
         if hub:
             hub.set_zone(self._device_id, self._index, is_on=False, rgb=(0, 0, 0))
+            device = (self._entry.data.get(CONF_DEVICES) or {}).get(self._device_id) or {}
             still = any(
                 hub.zone_state(self._device_id, i).get("on")
-                for i in range(len(_zones(self._entry.data[CONF_DEVICES][self._device_id])))
+                for i in range(len(_zones(device)))
             )
-            if still:
-                # Other zones still paint — leave the loop running.
-                pass
-            else:
+            if not still:
                 await hub.refresh()
                 tuya = _tuya_device(self.hass, self._entry, self._device_id)
                 if tuya is not None:
@@ -311,7 +325,10 @@ def zones_painting(hass, entry, device_id: str) -> bool:
     hub = _hubs(hass).get(entry.entry_id)
     if not hub:
         return False
-    state = hub._ensure_state(device_id)
+    try:
+        state = hub._ensure_state(device_id)
+    except Exception:  # noqa: BLE001
+        return False
     return any(slot.get("on") for slot in state)
 
 
