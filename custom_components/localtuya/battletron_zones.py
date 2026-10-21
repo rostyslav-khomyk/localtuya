@@ -231,6 +231,8 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
     ready: set[str] = set()
     painting: set[str] = set()
     last_negotiate = 0.0
+    frames = 0
+    last_beat = 0.0
     try:
         while not stop.is_set():
             if not sender._devices:
@@ -261,6 +263,10 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
                     painting.add(device_id)
                     _LOGGER.info("Zone UDP session painting %s", device_id[:8])
                 sender.send_colors(device_id, colors, counts)
+                frames += 1
+            if now - last_beat >= 2.0 and frames:
+                _LOGGER.info("Zone UDP heartbeat frames=%s ready=%s", frames, len(ready))
+                last_beat = now
             stop.wait(interval)
     except Exception:
         _LOGGER.exception("Zone painter thread crashed")

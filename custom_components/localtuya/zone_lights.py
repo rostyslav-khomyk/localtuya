@@ -283,30 +283,27 @@ class ZonePaintHub:
         )
 
     async def _power_one(self, device_id: str):
+        """Arm a strip for zone UDP.
+
+        Do **not** set power/colour over TCP — that writes DP24 and the strip
+        shows solid orange whenever UDP stalls. Mac strip.js never opens TCP;
+        a direct ZoneSender from the HA host paints RGB the same way. We only
+        hold the colour TCP link closed so localtuya cannot fight the painter.
+        """
         if device_id in self._powered:
             return
-        device = self._device(device_id)
         tuya = _tuya_device(self.hass, self.entry, device_id)
-        power = _power_dp(device) if device else None
-        if tuya is None or power is None:
-            return
-        mode = _mode_dp(device) if device else None
-        try:
-            # Colour mode + close TCP — same as Mac UDP clients. Power-only
-            # left the last solid colour (orange) on and hid zone frames when
-            # the strip was still in music/scene mode.
-            await tuya.async_power_for_zones(power, mode)
-            self._powered.add(device_id)
-            _LOGGER.info(
-                "Zone strip %s powered (mode_dp=%s)",
-                device_id[:8],
-                mode,
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Could not power zone strip %s: %s", device_id[:8], err)
+        if tuya is not None:
+            try:
+                tuya._pending_status = {}
+                await tuya.async_hold_tcp()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Zone TCP hold %s: %s", device_id[:8], err)
+        self._powered.add(device_id)
+        _LOGGER.info("Zone strip %s armed (UDP-only, TCP held)", device_id[:8])
 
     async def _power_off(self, device_id: str):
-        """Turn the physical strip off so an all-off zone set stays dark."""
+        """Best-effort TCP power off after black UDP frames; keep TCP held."""
         device = self._device(device_id)
         tuya = _tuya_device(self.hass, self.entry, device_id)
         power = _power_dp(device) if device else None
@@ -326,7 +323,8 @@ class ZonePaintHub:
         finally:
             tuya._zone_tcp_window = False
             tuya._pending_status = {}
-            await tuya.async_release_tcp()
+            # Hold closed — release_tcp() reconnects and can push DP24 orange.
+            await tuya.async_hold_tcp()
 
     async def stop_device(self, device_id: str):
         for slot in self._ensure_state(device_id):
