@@ -2,10 +2,11 @@
 
 This fork is [hass-localtuya](https://github.com/xZetsubou/hass-localtuya) with Tuya protocol 3.5, plus **Battletron zone lights**: each configured zone is a normal Home Assistant RGB light. Colour and brightness are painted over **UDP 40001** (same framing as the Mac `strip.js` client). Solid colour TCP is held closed while zones are active so music/colour DP does not fight the UDP frames.
 
-The Mac grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges). It pushes edge colours to those zone entities over the HA **REST** API (`light.turn_on`). Hyperion is not used.
+The Mac grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges). It serves granular edge colours over an authenticated **Hyperion-compatible WebSocket**. HA pulls frames and owns all UDP output. Its authenticated HTTP endpoint controls acquisition and release; it does not send each sampled colour through `light.turn_on`.
 
 ```
-Screen Edges  --HA REST-->  light.*_zone_*  -->  localtuya UDP :40001  -->  Battletron strip
+Screen Edges --Hyperion WebSocket--> HA granular mapping --UDP :40001--> strips
+HA zone light states ------------------------^ (when screen sync releases)
 ```
 
 ## Configure zones on a strip
@@ -54,4 +55,8 @@ Do not remove the device from Smart Life until local control works — removing 
 
 ## Screen Edges (Mac)
 
-Install and map zone lights as described in the [screen-edges README](https://github.com/rostyslav-khomyk/screen-edges). Sync pushes REST `light.turn_on` only; LocalTuya owns UDP to the strip.
+Install and map zone lights as described in the [screen-edges README](https://github.com/rostyslav-khomyk/screen-edges). Requires this fork version 2026.10.2 and HA Core 2026.10.2 or newer. Each destination zone can select an edge and reverse its sample order; several zones can sample the same edge. The supported frame has 20 logical sections per strip. The inset monitor strip lengths 27/57/27 cm allocate 5/10/5 sections, while each run samples the full corresponding screen edge. Desk zone lengths must be measured independently.
+
+During sync, ordinary zone output is suspended and its HA states remain intact. Manual commands and layout edits return an error until sync is paused. Pause, Quit, disconnect and a five-second frame timeout release ownership and restore those states, including zones previously off.
+
+See [implementation and validation](GRANULAR_SYNC_IMPLEMENTATION.md) for local tests and the coordinated deployment gate.

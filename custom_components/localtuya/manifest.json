@@ -3,11 +3,13 @@
   "name": "Local Tuya",
   "codeowners": [],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": [
+    "http"
+  ],
   "documentation": "https://github.com/rostyslav-khomyk/localtuya/",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/rostyslav-khomyk/localtuya/issues",
   "requirements": [],
-  "version": "2026.10.1"
+  "version": "2026.10.2"
 }

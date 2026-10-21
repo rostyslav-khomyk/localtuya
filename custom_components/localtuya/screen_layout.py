@@ -1,4 +1,6 @@
-"""Zone lengths for a strip that can show at most four colors at once."""
+"""Physical zone allocation and the verified variable-palette UDP payload."""
+
+import math
 
 EDGES = ("left", "top", "right", "bottom")
 SEGMENTS = 16
@@ -7,7 +9,7 @@ SEGMENTS = 16
 def zone_counts(lengths_cm, segments=SEGMENTS):
     """Turn centimetre lengths into segment counts that add up to `segments`.
 
-    The Battletron zone packet has four color slots. Each length becomes one slot.
+    Manual lights support up to four physical zones; streaming uses 20 sections.
     """
     lengths = [int(n) for n in lengths_cm if int(n) > 0]
     if not lengths or len(lengths) > 4:
@@ -32,17 +34,25 @@ def zone_counts(lengths_cm, segments=SEGMENTS):
 
 
 def color_payload(colors, counts):
-    """Build the 0004 HSV payload. `colors` are RGB tuples in zone order.
+    """Build the palette-count + HSV slots + section mapping payload. `colors` are RGB tuples in zone order.
 
     Unused colour slots clone the last colour — same as battletron-zones/strip.js.
     Off zones must pass (0,0,0) explicitly in `colors`, not rely on padding.
     """
-    slots = [_hsv_word(rgb) for rgb in list(colors)[:4]]
+    colors = list(colors)
+    counts = list(counts)
+    if not 1 <= len(colors) <= 20 or len(counts) != len(colors):
+        raise ValueError("Use one count per color, at most 20 colors")
+    if any(type(n) is not int or n < 0 for n in counts) or not 1 <= sum(counts) <= 20:
+        raise ValueError("Use 1 to 20 mapped sections")
+    if any(len(rgb) != 3 or any(type(c) is not int or not 0 <= c <= 255 for c in rgb) for rgb in colors):
+        raise ValueError("RGB channels must be integers from 0 to 255")
+    slots = [_hsv_word(rgb) for rgb in colors]
     while len(slots) < 4:
         slots.append(slots[-1])
-    segments = sum(counts)
     mapping = "".join(f"{index + 1:02x}" * count for index, count in enumerate(counts))
-    return "0004" + "".join(slots) + f"{segments:04x}" + mapping
+    return f"{len(slots):04x}" + "".join(slots) + f"{sum(counts):04x}" + mapping
+
 
 
 def _hsv_word(rgb):
@@ -63,5 +73,6 @@ def _rgb_to_hsv(rgb):
         else:
             hue = 60 * ((r - g) / (high - low)) + 240
     sat = 0 if high == 0 else 1 - low / high
-    val = round((high / 255) * 1000)
-    return round(hue) % 360, round(sat * 1000), val
+    val = math.floor((high / 255) * 1000 + 0.5)
+    # Match JavaScript Math.round, including values exactly halfway.
+    return math.floor(hue + 0.5) % 360, math.floor(sat * 1000 + 0.5), val

@@ -71,6 +71,9 @@ SERVICE_UPDATE_DPS_SCHEMA = vol.Schema(
 async def async_setup(hass: HomeAssistant, config: dict):
     """Set up the LocalTuya integration component."""
     hass.data.setdefault(DOMAIN, {})
+    from .screen_stream import ScreenStreamView
+
+    hass.http.register_view(ScreenStreamView(hass))
 
     current_entries = hass.config_entries.async_entries(DOMAIN)
     device_cache = {}
@@ -396,11 +399,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     from .screen_sync import _drop_extra_zones
 
     _drop_extra_zones(hass, entry)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
-
     from .screen_sync import async_start_hub
 
     await async_start_hub(hass, entry)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
 
     # Note: entry.async_on_unload items are called in LIFO order!
 

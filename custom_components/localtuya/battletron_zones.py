@@ -283,16 +283,20 @@ async def run_zone_loop(sender: ZoneSender, device_ids, color_fn, interval=0.125
         None, _zone_thread, sender, list(device_ids), color_fn, interval, stop
     )
     try:
-        await task
+        await asyncio.shield(task)
     except asyncio.CancelledError:
         raise
     except Exception:
         _LOGGER.exception("Zone painter task failed")
     finally:
         stop.set()
-        if not task.done():
+        # HA entry unload and hub shutdown can both cancel this task. Keep the
+        # bounded socket worker joined before another painter may bind :40001.
+        while not task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=3)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
         sender.close()

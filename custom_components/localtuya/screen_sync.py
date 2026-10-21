@@ -27,6 +27,13 @@ def _zones(device):
     return list(_sync(device).get("zones") or [])
 
 
+def _assert_layout_editable(hass, entry, device_id):
+    from .zone_lights import _hubs
+
+    if hub := _hubs(hass).get(entry.entry_id):
+        hub.assert_manual(device_id)
+
+
 def _save(hass, entry):
     domain_data = hass.data.setdefault(DOMAIN, {})
     skips = domain_data.setdefault("_skip_reload_entries", set())
@@ -87,6 +94,7 @@ class ZoneLengthNumber(NumberEntity):
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_set_native_value(self, value: float) -> None:
+        _assert_layout_editable(self.hass, self._entry, self._device_id)
         zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
         zones[self._index]["cm"] = max(1, int(value))
         self._attr_native_value = zones[self._index]["cm"]
@@ -105,6 +113,7 @@ class AddZoneButton(ButtonEntity):
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_press(self) -> None:
+        _assert_layout_editable(self.hass, self._entry, self._device_id)
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         zones = list(sync.get("zones") or [])
@@ -130,6 +139,7 @@ class RemoveZoneButton(ButtonEntity):
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_press(self) -> None:
+        _assert_layout_editable(self.hass, self._entry, self._device_id)
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         zones = list(sync.get("zones") or [])
