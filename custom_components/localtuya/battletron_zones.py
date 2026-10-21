@@ -1,4 +1,6 @@
-"""UDP zone frames for Battletron strips. Same framing as the Mac proof of concept."""
+"""UDP zone frames for Battletron strips. Same framing as the Mac strip.js client."""
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -7,35 +9,39 @@ import logging
 import os
 import socket
 import struct
+import threading
+import time
 import zlib
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-_LOGGER = logging.getLogger(__name__)
-
 from .screen_layout import color_payload
+
+_LOGGER = logging.getLogger(__name__)
 
 PORT = 40001
 HEADER = bytes.fromhex("00006699")
 TAIL = bytes.fromhex("00009966")
 FIXED_KEY = bytes.fromhex("6f36045d84b042e01e29b7c819e37cf7")
 CONTROLLER_UUID = "420691337420b00b"
+NEGOTIATE = 0x05
+NEGOTIATE_REPLY = 0x06
+COLORS = 0x10
 
 
-def _crc32(buf):
+def _crc32(buf: bytes) -> bytes:
     return struct.pack(">I", zlib.crc32(buf) & 0xFFFFFFFF)
 
 
-def _pad_id(text):
+def _pad_id(text: str) -> bytes:
     return bytes.fromhex(text.encode("utf-8").hex().ljust(50, "0") + "00")
 
 
-def _gcm(plain, nonce, aad, key):
+def _gcm(plain: bytes, nonce: bytes, aad: bytes | None, key: bytes) -> bytes:
     return AESGCM(key).encrypt(nonce, plain, aad)
 
 
-def aad(sequence, kind, controller_crc, payload_len, devices):
-    """22-byte additional data: version, seq, type, controller crc, length, count."""
+def _aad(sequence: int, kind: int, controller_crc: bytes, payload_len: int, devices: int) -> bytes:
     seq = f"{sequence:08x}"
     type_hex = f"{kind:08x}"
     total = f"{42 + payload_len:08x}"
@@ -43,19 +49,42 @@ def aad(sequence, kind, controller_crc, payload_len, devices):
     return bytes.fromhex("0000" + seq + type_hex) + controller_crc + bytes.fromhex(total + frames)
 
 
+def _route(host: str) -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((host, PORT))
+        return probe.getsockname()[0]
+    except OSError:
+        return "0.0.0.0"
+    finally:
+        probe.close()
+
+
+def _targets(host: str, bind_ip: str) -> list[str]:
+    """Match strip.js: subnet broadcast first, then the strip unicast."""
+    parts = (bind_ip if bind_ip != "0.0.0.0" else host).split(".")
+    targets: list[str] = []
+    if len(parts) == 4:
+        targets.append(".".join(parts[:3] + ["255"]))
+    targets.append(host)
+    return list(dict.fromkeys(targets))
+
+
 class ZoneSender:
-    """One UDP socket. Several strips can share it."""
+    """One shared UDP socket. Several strips can use it (only one process may bind 40001)."""
 
     def __init__(self):
-        self._sock = None
-        self._devices = {}
+        self._sock: socket.socket | None = None
+        self._devices: dict[str, dict] = {}
 
-    def add(self, device_id, local_key, host):
+    def add(self, device_id: str, local_key: str, host: str) -> None:
         raw = local_key.encode("utf-8")
         key = bytes.fromhex(raw.hex().ljust(32, "0")[:32])
         controller_crc = _crc32(_pad_id(CONTROLLER_UUID))
         device_crc = _crc32(_pad_id(device_id) + controller_crc)
         bind_ip = _route(host)
+        token = os.urandom(16)
+        rnd = os.urandom(16)
         self._devices[device_id] = {
             "key": key,
             "host": host,
@@ -65,43 +94,50 @@ class ZoneSender:
             "device_crc": device_crc,
             "session": None,
             "sequence": 1,
-            "token": os.urandom(16),
-            "rnd": os.urandom(16),
+            "token": token,
+            "rnd": rnd,
+            "negotiation": _gcm(token, token[:12], None, key)[:16],
         }
-        token = self._devices[device_id]["token"]
-        self._devices[device_id]["negotiation"] = _gcm(token, token[:12], None, key)[:16]
 
-    def close(self):
+    def close(self) -> None:
         if self._sock:
-            self._sock.close()
+            try:
+                self._sock.close()
+            except OSError:
+                pass
             self._sock = None
+        self._devices.clear()
 
-    def _socket(self):
+    def _socket(self) -> socket.socket:
         if self._sock:
             return self._sock
-        bind_ip = next((dev["bind_ip"] for dev in self._devices.values() if dev.get("bind_ip")), "0.0.0.0")
+        bind_ip = next(
+            (dev["bind_ip"] for dev in self._devices.values() if dev.get("bind_ip")),
+            "0.0.0.0",
+        )
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind((bind_ip, PORT))
-        sock.setblocking(False)
+        sock.settimeout(0.05)
         self._sock = sock
+        _LOGGER.info("Zone socket on %s for %s", bind_ip, ",".join(self._devices))
         return sock
 
-    def negotiate(self, device_id):
+    def negotiate(self, device_id: str) -> None:
         dev = self._devices[device_id]
         plain = b"\x00\x00\x00\x00" + dev["token"] + dev["rnd"]
-        self._send(dev, 0x05, plain, FIXED_KEY, negotiating=True)
+        self._send(dev, NEGOTIATE, plain, FIXED_KEY)
 
-    def send_colors(self, device_id, colors, counts):
+    def send_colors(self, device_id: str, colors, counts) -> None:
         dev = self._devices[device_id]
         if not dev["session"]:
             return
         plain = bytes.fromhex(color_payload(colors, counts))
-        self._send(dev, 0x10, plain, dev["session"], negotiating=False)
+        self._send(dev, COLORS, plain, dev["session"])
 
-    def _send(self, dev, kind, plain, key, negotiating):
+    def _send(self, dev: dict, kind: int, plain: bytes, key: bytes) -> None:
         nonce = os.urandom(12)
-        extra = aad(dev["sequence"], kind, dev["controller_crc"], len(plain) + 24, 1)
+        extra = _aad(dev["sequence"], kind, dev["controller_crc"], len(plain) + 24, 1)
         dev["sequence"] = (dev["sequence"] + 1) & 0xFFFFFFFF
         blob = _gcm(plain, nonce, extra, key)
         enc, tag = blob[:-16], blob[-16:]
@@ -124,14 +160,17 @@ class ZoneSender:
             except OSError:
                 continue
 
-    def pump(self):
-        """Read one reply, if any. Returns the device id that completed negotiation."""
+    def pump(self) -> str | None:
+        """Read one negotiate reply. Returns the device id that completed."""
         sock = self._socket()
         try:
             msg, _addr = sock.recvfrom(2048)
-        except BlockingIOError:
+        except (TimeoutError, BlockingIOError, OSError):
             return None
         if len(msg) < 64 or not msg.startswith(HEADER) or not msg.endswith(TAIL):
+            return None
+        kind = struct.unpack(">I", msg[10:14])[0]
+        if kind != NEGOTIATE_REPLY:
             return None
         data_len = struct.unpack(">I", msg[42:46])[0]
         frame_aad = msg[4:26]
@@ -161,52 +200,53 @@ class ZoneSender:
         return None
 
 
-async def run_zone_loop(sender, device_ids, color_fn, interval=0.25):
-    """Negotiate until each strip answers, then keep sending colors."""
-    loop = asyncio.get_running_loop()
-    ready = set()
-    painting = set()
+def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: float, stop: threading.Event):
+    """Blocking loop. Matches the node setInterval clients."""
+    ready: set[str] = set()
+    painting: set[str] = set()
     last_negotiate = 0.0
     try:
-        while True:
-            now = loop.time()
-            if now - last_negotiate >= 1:
+        while not stop.is_set():
+            now = time.monotonic()
+            if now - last_negotiate >= 1.0:
                 for device_id in device_ids:
                     if device_id not in ready:
-                        await loop.run_in_executor(None, sender.negotiate, device_id)
+                        sender.negotiate(device_id)
                 last_negotiate = now
-            finished = await loop.run_in_executor(None, sender.pump)
+            finished = sender.pump()
             if finished:
                 ready.add(finished)
                 _LOGGER.info("Zone session ready for %s", finished)
-            for device_id in ready:
+            for device_id in list(ready):
                 colors, counts = color_fn(device_id)
-                if colors:
-                    if device_id not in painting:
-                        painting.add(device_id)
-                        _LOGGER.info("Painting %s from the screen", device_id)
-                    await loop.run_in_executor(None, sender.send_colors, device_id, colors, counts)
-            await asyncio.sleep(interval)
+                if not colors:
+                    continue
+                if device_id not in painting:
+                    painting.add(device_id)
+                    _LOGGER.info(
+                        "Painting %s from the screen %s",
+                        device_id,
+                        " ".join(str(tuple(c)) for c in colors),
+                    )
+                sender.send_colors(device_id, colors, counts)
+            stop.wait(interval)
     finally:
         sender.close()
 
 
-def _route(host):
-    """Source address this machine uses to reach the strip."""
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+async def run_zone_loop(sender: ZoneSender, device_ids, color_fn, interval=0.125):
+    """Run the zone painter in a worker thread so timing matches strip.js."""
+    stop = threading.Event()
+    loop = asyncio.get_running_loop()
+    task = loop.run_in_executor(
+        None, _zone_thread, sender, list(device_ids), color_fn, interval, stop
+    )
     try:
-        probe.connect((host, PORT))
-        return probe.getsockname()[0]
-    except OSError:
-        return "0.0.0.0"
-    finally:
-        probe.close()
-
-
-def _targets(host, bind_ip):
-    """Unicast the strip, and also the subnet broadcast the Mac client uses."""
-    targets = [host]
-    parts = (bind_ip if bind_ip != "0.0.0.0" else host).split(".")
-    if len(parts) == 4:
-        targets.append(".".join(parts[:3] + ["255"]))
-    return list(dict.fromkeys(targets))
+        await task
+    except asyncio.CancelledError:
+        stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        raise

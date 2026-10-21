@@ -71,13 +71,16 @@ class ScreenHub:
             if host and key:
                 self.sender.add(dev_id, key, host)
 
-    async def start(self):
-        self.refresh_devices()
-        used = {
+    def _used_servers(self):
+        return {
             _sync(device).get("server")
             for device in self.entry.data.get(CONF_DEVICES, {}).values()
             if _sync(device).get("enabled")
         }
+
+    def ensure_follows(self):
+        """Keep a live Hyperion stream for every server a strip is following."""
+        used = self._used_servers()
         for server in _servers(self.entry):
             name = server.get("name")
             if name not in used:
@@ -89,10 +92,16 @@ class ScreenHub:
                     self._follow(server, cache),
                     f"screen-edges-{name}",
                 )
+
+    async def start(self):
+        self.refresh_devices()
+        self.ensure_follows()
         device_ids = list(self.sender._devices)
         if not device_ids:
             return
         await self._power_devices(device_ids)
+        # Let the color link finish closing before zone negotiate (strip.js never uses TCP).
+        await asyncio.sleep(0.5)
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
@@ -111,14 +120,20 @@ class ScreenHub:
         """Restart zone painting. Set power=True only when a strip may be off."""
         if self._run:
             self._run.cancel()
+            try:
+                await self._run
+            except asyncio.CancelledError:
+                pass
             self._run = None
         self.refresh_devices()
+        self.ensure_follows()
         device_ids = list(self.sender._devices)
         if not device_ids:
             self.sender.close()
             return
         if power:
             await self._power_devices(device_ids)
+            await asyncio.sleep(0.5)
         self._run = self.entry.async_create_background_task(
             self.hass,
             run_zone_loop(self.sender, device_ids, self._colors_for),
@@ -263,7 +278,7 @@ class ScreenSyncSwitch(SwitchEntity):
             await tuya.async_power_for_zones(_light_power_dp(device))
         hub = _hubs(self.hass).get(self._entry.entry_id)
         if hub:
-            # Other strips are already powered. Do not reopen their color link.
+            # Power already done for this strip. Keep other strips' TCP closed.
             await hub.restart_zones(power=False)
         self.schedule_update_ha_state()
         _poke(tuya)
