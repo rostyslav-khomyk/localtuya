@@ -165,6 +165,7 @@ async def run_zone_loop(sender, device_ids, color_fn, interval=0.25):
     """Negotiate until each strip answers, then keep sending colors."""
     loop = asyncio.get_running_loop()
     ready = set()
+    painting = set()
     last_negotiate = 0.0
     try:
         while True:
@@ -181,6 +182,9 @@ async def run_zone_loop(sender, device_ids, color_fn, interval=0.25):
             for device_id in ready:
                 colors, counts = color_fn(device_id)
                 if colors:
+                    if device_id not in painting:
+                        painting.add(device_id)
+                        _LOGGER.info("Painting %s from the screen", device_id)
                     await loop.run_in_executor(None, sender.send_colors, device_id, colors, counts)
             await asyncio.sleep(interval)
     finally:

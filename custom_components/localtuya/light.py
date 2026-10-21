@@ -302,9 +302,26 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         return attributes
 
+    def _screen_sync_active(self):
+        from .screen_sync import screen_sync_enabled
+
+        return screen_sync_enabled(self._device._entry, self._device.id)
+
+    @property
+    def available(self) -> bool:
+        """Stay usable while screen sync is holding the local connection closed."""
+        if self._screen_sync_active():
+            return True
+        return super().available()
+
     @property
     def is_on(self):
-        """Check if Tuya light is on."""
+        """Check if Tuya light is on.
+
+        Screen sync and this switch cannot both be on.
+        """
+        if self._screen_sync_active():
+            return False
         return self._state
 
     @property
@@ -530,6 +547,12 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn on or control the light."""
+        released_sync = False
+        if self._screen_sync_active():
+            from .screen_sync import async_release_screen_sync
+
+            released_sync = True
+            await async_release_screen_sync(self._device)
         states = {}
         if not self.is_on or self._write_only:
             states[self._dp_id] = True
@@ -615,6 +638,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
             states[self._config.get(CONF_COLOR_MODE)] = color_mode
 
         await self._device.set_dps(states)
+        if released_sync:
+            entry_id = self._device._entry.entry_id
+            self.hass.async_create_task(self.hass.config_entries.async_reload(entry_id))
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""

@@ -38,4 +38,12 @@ class LocalTuyaButton(LocalTuyaEntity, ButtonEntity):
         await self._device.set_dp(True, self._dp_id)
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaButton, flow_schema)
+_platform_setup = partial(async_setup_entry, DOMAIN, LocalTuyaButton, flow_schema)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    """Set up DP buttons and the screen-zone add/remove buttons."""
+    await _platform_setup(hass, entry, async_add_entities)
+    from .screen_sync import async_add_buttons
+
+    await async_add_buttons(hass, entry, async_add_entities)

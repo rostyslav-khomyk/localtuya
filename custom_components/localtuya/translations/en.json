@@ -45,7 +45,9 @@
             "entity_already_configured": "This entity has already been configured.",
             "address_in_use": "TCP port 6668 (used for discovery) is already in use. Check no other integration is using it.",
             "discovery_failed": "Something failed when discovering devices. See log for details. If problem persists, create a new issue (including debug logs).",
-            "empty_dps": "Connection to device succeeded but no datapoints could be found. Please try set-up again. If problem persists, create a new issue (including debug logs)."
+            "empty_dps": "Connection to device succeeded but no datapoints could be found. Please try set-up again. If problem persists, create a new issue (including debug logs).",
+            "screen_down": "Could not reach the screen server. Check the IP address and port.",
+            "screen_auth": "The screen server rejected this token."
         },
         "step": {
             "yaml_import": {
@@ -66,11 +68,18 @@
                 "title": "Screen color server",
                 "description": "{msg}",
                 "data": {
+                    "server_pick": "Discovered server"
+                }
+            },
+            "screen_server": {
+                "title": "Screen color server",
+                "description": "{msg}",
+                "submit": "Test connection",
+                "data": {
                     "server_name": "Server name",
                     "host": "Screen-edges host",
                     "port": "WebSocket port",
-                    "screen_code": "Token",
-                    "device_id": "LED strip"
+                    "screen_code": "Token"
                 }
             },
             "add_device": {

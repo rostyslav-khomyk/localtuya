@@ -155,8 +155,19 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         """Set the entities associated with this device."""
         self._entities.extend(entities)
 
+    def _screen_sync_blocks_tcp(self) -> bool:
+        """Screen sync uses the zone link. The color connection has to stay closed."""
+        try:
+            device = self._entry.data.get(CONF_DEVICES, {}).get(self.id) or {}
+        except (AttributeError, TypeError):
+            return False
+        return bool((device.get("screen_sync") or {}).get("enabled"))
+
     async def async_connect(self, _now=None) -> None:
         """Connect to device if not already connected."""
+        if self._screen_sync_blocks_tcp():
+            return
+
         if self.is_closing or self.is_connecting:
             return
 
@@ -431,6 +442,10 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         attempts = 0
         while True:
             try:
+                if self._screen_sync_blocks_tcp():
+                    await asyncio.sleep(2)
+                    continue
+
                 # for sub-devices, if it is reported as offline then no need for reconnect.
                 if (
                     self.is_subdevice

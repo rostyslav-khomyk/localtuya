@@ -41,6 +41,10 @@
         "abort": {
             "no_devices": "Add a device with its local key before attaching a screen."
         },
+        "error": {
+            "screen_down": "Could not reach the screen server. Check the IP address and port.",
+            "screen_auth": "The screen server rejected this token."
+        },
         "step": {
             "init": {
                 "title": "LocalTuya Configuration",
@@ -63,11 +67,18 @@
                 "title": "Screen color server",
                 "description": "{msg}",
                 "data": {
+                    "server_pick": "Discovered server"
+                }
+            },
+            "screen_server": {
+                "title": "Screen color server",
+                "description": "{msg}",
+                "submit": "Test connection",
+                "data": {
                     "server_name": "Server name",
                     "host": "Screen-edges host",
                     "port": "WebSocket port",
-                    "screen_code": "Token",
-                    "device_id": "LED strip"
+                    "screen_code": "Token"
                 }
             },
             "entity": {

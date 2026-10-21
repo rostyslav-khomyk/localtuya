@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 import aiohttp
+from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.components.select import SelectEntity
 from homeassistant.components.switch import SwitchEntity
@@ -90,6 +91,22 @@ class ScreenHub:
             "battletron-zones",
         )
 
+    async def restart_zones(self):
+        """Apply a server or zone change without dropping the screen connection."""
+        if self._run:
+            self._run.cancel()
+            self._run = None
+        self.refresh_devices()
+        device_ids = list(self.sender._devices)
+        if not device_ids:
+            self.sender.close()
+            return
+        self._run = self.entry.async_create_background_task(
+            self.hass,
+            run_zone_loop(self.sender, device_ids, self._colors_for),
+            "battletron-zones",
+        )
+
     async def stop(self):
         for cache in self.edges.values():
             if cache.task:
@@ -120,7 +137,7 @@ class ScreenHub:
                 if not token:
                     raise RuntimeError("screen server has no token")
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url) as ws:
+                    async with session.ws_connect(url, compress=0) as ws:
                         await ws.send_json(
                             {
                                 "command": "authorize",
@@ -163,6 +180,36 @@ def _device_info(device_id, device):
     return DeviceInfo(identifiers={(DOMAIN, f"local_{device_id}")}, name=name)
 
 
+def _zones(device):
+    return list(_sync(device).get("zones") or [])
+
+
+def _save(hass, entry):
+    hass.config_entries.async_update_entry(entry, data=dict(entry.data))
+
+
+async def _persist_and_reload(hass, entry):
+    _save(hass, entry)
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+def _light_power_dp(device):
+    for entity in device.get("entities") or []:
+        if str(entity.get("platform", "")).lower() == "light":
+            return entity.get("id")
+    return None
+
+
+def _tuya_device(hass, entry, device_id):
+    data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if not data:
+        return None
+    for device in data.devices.values():
+        if getattr(device, "id", None) == device_id:
+            return device
+    return None
+
+
 class ScreenSyncSwitch(SwitchEntity):
     _attr_has_entity_name = True
     _attr_name = "Screen sync"
@@ -175,16 +222,69 @@ class ScreenSyncSwitch(SwitchEntity):
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_turn_on(self, **kwargs):
-        _sync(self._entry.data[CONF_DEVICES][self._device_id])["enabled"] = True
+        """Screen sync owns the strip. The light switch turns off."""
+        device = self._entry.data[CONF_DEVICES][self._device_id]
+        tuya = _tuya_device(self.hass, self._entry, self._device_id)
+        power = _light_power_dp(device)
+        if tuya and power is not None:
+            if not tuya.connected:
+                await tuya.async_connect()
+            try:
+                await tuya.set_dp(True, power)
+            except Exception as err:
+                _LOGGER.warning("Could not power %s for screen sync: %s", self._device_id, err)
+        sync = _sync(device)
+        sync["enabled"] = True
+        device["screen_sync"] = sync
         self._attr_is_on = True
         self.schedule_update_ha_state()
         await _persist_and_reload(self.hass, self._entry)
 
     async def async_turn_off(self, **kwargs):
-        _sync(self._entry.data[CONF_DEVICES][self._device_id])["enabled"] = False
+        device = self._entry.data[CONF_DEVICES][self._device_id]
+        sync = _sync(device)
+        sync["enabled"] = False
+        device["screen_sync"] = sync
         self._attr_is_on = False
         self.schedule_update_ha_state()
         await _persist_and_reload(self.hass, self._entry)
+
+
+class ScreenServerSelect(SelectEntity):
+    """Which verified screen server this strip follows."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Screen server"
+
+    def __init__(self, entry, device_id, device):
+        self._entry = entry
+        self._device_id = device_id
+        names = [server.get("name") for server in _servers(entry) if server.get("token")]
+        current = _sync(device).get("server")
+        if current and current not in names:
+            names.insert(0, current)
+        if not names:
+            names = ["No screen server yet"]
+        self._attr_options = names
+        self._attr_current_option = current if current in names else names[0]
+        self._attr_unique_id = f"local_{device_id}_screen_server"
+        self._attr_device_info = _device_info(device_id, device)
+
+    async def async_select_option(self, option: str) -> None:
+        if option == "No screen server yet":
+            return
+        device = self._entry.data[CONF_DEVICES][self._device_id]
+        sync = _sync(device)
+        sync["server"] = option
+        sync.setdefault("zones", [])
+        sync.setdefault("enabled", False)
+        device["screen_sync"] = sync
+        self._attr_current_option = option
+        self.schedule_update_ha_state()
+        _save(self.hass, self._entry)
+        hub = _hubs(self.hass).get(self._entry.entry_id)
+        if hub:
+            await hub.restart_zones()
 
 
 class ZoneLengthNumber(NumberEntity):
@@ -199,21 +299,18 @@ class ZoneLengthNumber(NumberEntity):
         self._entry = entry
         self._device_id = device_id
         self._index = index
-        zones = _sync(device).get("zones") or []
-        cm = int(zones[index]["cm"]) if index < len(zones) else 0
-        self._attr_native_value = cm
+        zones = _zones(device)
+        self._attr_native_value = int(zones[index].get("cm") or 0)
         self._attr_name = f"Zone {index + 1} length"
         self._attr_unique_id = f"local_{device_id}_zone_{index}_cm"
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_set_native_value(self, value: float) -> None:
         zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
-        while len(zones) <= self._index:
-            zones.append({"edge": "top", "cm": 0})
         zones[self._index]["cm"] = int(value)
         self._attr_native_value = int(value)
         self.schedule_update_ha_state()
-        await _persist_and_reload(self.hass, self._entry)
+        _save(self.hass, self._entry)
 
 
 class ZoneEdgeSelect(SelectEntity):
@@ -224,58 +321,136 @@ class ZoneEdgeSelect(SelectEntity):
         self._entry = entry
         self._device_id = device_id
         self._index = index
-        zones = _sync(device).get("zones") or []
-        current = zones[index]["edge"] if index < len(zones) else "top"
-        self._attr_current_option = current
+        zones = _zones(device)
+        self._attr_current_option = zones[index].get("edge") or "top"
         self._attr_name = f"Zone {index + 1} edge"
         self._attr_unique_id = f"local_{device_id}_zone_{index}_edge"
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_select_option(self, option: str) -> None:
         zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
-        while len(zones) <= self._index:
-            zones.append({"edge": "top", "cm": 0})
         zones[self._index]["edge"] = option
         self._attr_current_option = option
         self.schedule_update_ha_state()
+        _save(self.hass, self._entry)
+
+
+class AddZoneButton(ButtonEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Add zone"
+
+    def __init__(self, entry, device_id, device):
+        self._entry = entry
+        self._device_id = device_id
+        self._attr_unique_id = f"local_{device_id}_add_zone"
+        self._attr_device_info = _device_info(device_id, device)
+
+    async def async_press(self) -> None:
+        device = self._entry.data[CONF_DEVICES][self._device_id]
+        sync = _sync(device)
+        zones = list(sync.get("zones") or [])
+        if len(zones) >= 4:
+            return
+        used = {zone.get("edge") for zone in zones}
+        edge = next((name for name in EDGES if name not in used), "bottom")
+        zones.append({"edge": edge, "cm": 20})
+        sync["zones"] = zones
+        device["screen_sync"] = sync
         await _persist_and_reload(self.hass, self._entry)
 
 
-async def _persist_and_reload(hass, entry):
-    hass.config_entries.async_update_entry(entry, data=dict(entry.data))
-    await hass.config_entries.async_reload(entry.entry_id)
+class RemoveZoneButton(ButtonEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, entry, device_id, device, index):
+        self._entry = entry
+        self._device_id = device_id
+        self._index = index
+        self._attr_name = f"Remove zone {index + 1}"
+        self._attr_unique_id = f"local_{device_id}_zone_{index}_remove"
+        self._attr_device_info = _device_info(device_id, device)
+
+    async def async_press(self) -> None:
+        device = self._entry.data[CONF_DEVICES][self._device_id]
+        sync = _sync(device)
+        zones = list(sync.get("zones") or [])
+        if self._index >= len(zones):
+            return
+        zones.pop(self._index)
+        sync["zones"] = zones
+        device["screen_sync"] = sync
+        await _persist_and_reload(self.hass, self._entry)
 
 
-def _synced_devices(entry):
+def _strip_devices(entry):
     for device_id, device in entry.data.get(CONF_DEVICES, {}).items():
-        if _sync(device):
-            yield device_id, device
+        yield device_id, device
 
 
 async def async_add_switches(hass, entry, async_add_entities):
     async_add_entities(
-        [ScreenSyncSwitch(entry, device_id, device) for device_id, device in _synced_devices(entry)]
+        [ScreenSyncSwitch(entry, device_id, device) for device_id, device in _strip_devices(entry)]
     )
 
 
 async def async_add_numbers(hass, entry, async_add_entities):
     entities = []
-    for device_id, device in _synced_devices(entry):
-        for index in range(4):
+    for device_id, device in _strip_devices(entry):
+        for index in range(len(_zones(device))):
             entities.append(ZoneLengthNumber(entry, device_id, device, index))
     async_add_entities(entities)
 
 
 async def async_add_selects(hass, entry, async_add_entities):
     entities = []
-    for device_id, device in _synced_devices(entry):
-        for index in range(4):
+    for device_id, device in _strip_devices(entry):
+        entities.append(ScreenServerSelect(entry, device_id, device))
+        for index in range(len(_zones(device))):
             entities.append(ZoneEdgeSelect(entry, device_id, device, index))
     async_add_entities(entities)
+
+
+async def async_add_buttons(hass, entry, async_add_entities):
+    entities = []
+    for device_id, device in _strip_devices(entry):
+        zones = _zones(device)
+        if len(zones) < 4:
+            entities.append(AddZoneButton(entry, device_id, device))
+        for index in range(len(zones)):
+            entities.append(RemoveZoneButton(entry, device_id, device, index))
+    async_add_entities(entities)
+
+
+async def async_release_screen_sync(device):
+    """Give the strip back to the light entity and reconnect local control."""
+    entry = device._entry
+    sync = _sync(entry.data[CONF_DEVICES][device.id])
+    sync["enabled"] = False
+    entry.data[CONF_DEVICES][device.id]["screen_sync"] = sync
+    _save(device.hass, entry)
+    hub = _hubs(device.hass).get(entry.entry_id)
+    if hub:
+        await hub.restart_zones()
+    await device.async_connect()
+
+
+def _hubs(hass):
+    return hass.data[DOMAIN].setdefault("screen_hubs", {})
+
+
+def screen_sync_enabled(entry, device_id):
+    device = entry.data.get(CONF_DEVICES, {}).get(device_id) or {}
+    return bool(_sync(device).get("enabled"))
 
 
 async def async_start_hub(hass, entry):
     hub = ScreenHub(hass, entry)
     await hub.start()
-    entry.async_on_unload(hub.stop)
+    _hubs(hass)[entry.entry_id] = hub
+
+    def _forget():
+        _hubs(hass).pop(entry.entry_id, None)
+        return hub.stop()
+
+    entry.async_on_unload(_forget)
     return hub

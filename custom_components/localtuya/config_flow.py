@@ -295,86 +295,121 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
         return self.async_show_menu(step_id="init", menu_options=configure_menu)
 
     async def async_step_screen_colors(self, user_input=None):
-        """Add a screen-edge server and attach it to a strip.
+        """Pick a Hyperion server. The next step tests it and saves it.
 
-        Zone lengths stay on the strip. This step does not edit them.
+        Strips choose the server on their own page. Several strips can share one.
         """
-        devices = self.config_entry.data.get(CONF_DEVICES, {})
-        if not devices:
-            return self.async_abort(reason="no_devices")
+        from .screen_discover import async_discover_screen_servers
+
+        if user_input is not None:
+            self._screen_pick = user_input["server_pick"]
+            return await self.async_step_screen_server()
+
         stored = list(self.config_entry.data.get("screen_servers") or [])
+        try:
+            found = await async_discover_screen_servers()
+        except Exception:
+            found = []
+        self._screen_found = found
+        options = []
+        seen = set()
+        for item in found:
+            value = f"found:{item['host']}:{item['port']}"
+            options.append(SelectOptionDict(value=value, label=item["name"]))
+            seen.add(item["name"])
+        for item in stored:
+            if item.get("name") in seen:
+                continue
+            options.append(
+                SelectOptionDict(value=f"saved:{item.get('name')}", label=item.get("name") or item.get("host"))
+            )
+        options.append(SelectOptionDict(value="manual", label="Enter manually"))
+        default = options[0]["value"]
+        found_msg = (
+            "Choose a Hyperion server found on the network."
+            if found
+            else "No Hyperion server answered discovery. Enter one manually, or pick a server saved earlier."
+        )
+        return self.async_show_form(
+            step_id="screen_colors",
+            data_schema=vol.Schema(
+                {vol.Required("server_pick", default=default): SelectSelector(
+                    SelectSelectorConfig(options=options, mode=SelectSelectorMode.DROPDOWN)
+                )}
+            ),
+            last_step=False,
+            description_placeholders={"msg": found_msg},
+        )
+
+    async def async_step_screen_server(self, user_input=None):
+        """Edit the address and token, then test the connection."""
+        from .screen_discover import async_test_screen_server
+
+        stored = list(self.config_entry.data.get("screen_servers") or [])
+        found = getattr(self, "_screen_found", [])
+        pick = getattr(self, "_screen_pick", "manual")
+        current = {"name": "Mac mini", "host": "192.168.2.20", "port": 8090, "token": ""}
+        if pick.startswith("found:"):
+            _, host, port = pick.split(":", 2)
+            match = next((item for item in found if item["host"] == host and str(item["port"]) == port), None)
+            saved = next((item for item in stored if item.get("host") == host), None)
+            current = {
+                "name": (match or {}).get("name") or (saved or {}).get("name") or host,
+                "host": host,
+                "port": int(port),
+                "token": (saved or {}).get("token") or "",
+            }
+        elif pick.startswith("saved:"):
+            name = pick.split(":", 1)[1]
+            current = next((item for item in stored if item.get("name") == name), current)
+
         errors = {}
         if user_input is not None:
             name = user_input["server_name"].strip()
+            host = user_input["host"].strip()
+            port = int(user_input["port"])
             previous = next((item for item in stored if item.get("name") == name), None)
             code = (user_input.get("screen_code") or "").strip()
             if not code and previous:
                 code = previous.get("token") or ""
-            if not name or not code:
-                errors["base"] = "invalid_auth"
+            if not name or not host or not code:
+                errors["base"] = "screen_auth"
             else:
-                new_data = copy.deepcopy(dict(self.config_entry.data))
-                servers = [item for item in stored if item.get("name") != name]
-                servers.append(
-                    {
-                        "name": name,
-                        "host": user_input["host"].strip(),
-                        "port": int(user_input["port"]),
-                        "token": code,
-                    }
-                )
-                new_data["screen_servers"] = servers
-                dev_id = user_input["device_id"]
-                sync = dict(new_data[CONF_DEVICES][dev_id].get("screen_sync") or {})
-                sync["server"] = name
-                sync["enabled"] = bool(sync.get("enabled", True))
-                sync.setdefault("zones", [])
-                new_data[CONF_DEVICES][dev_id]["screen_sync"] = sync
-                new_data[CONF_DEVICES][dev_id]["local_only"] = True
-                return self._update_entry(new_data)
-
-        current = next((item for item in stored if item.get("name") == "Mac mini"), None)
-        if current is None and stored:
-            current = stored[0]
-        current = current or {}
-        attached = next(
-            (
-                dev_id
-                for dev_id, dev in devices.items()
-                if (dev.get("screen_sync") or {}).get("server") == current.get("name")
-            ),
-            next(iter(devices)),
-        )
-        device_select = SelectSelector(
-            SelectSelectorConfig(
-                options=[
-                    SelectOptionDict(
-                        value=dev_id,
-                        label=dev.get(CONF_FRIENDLY_NAME) or dev_id,
+                error = await async_test_screen_server(host, port, code)
+                if error:
+                    errors["base"] = error
+                else:
+                    new_data = copy.deepcopy(dict(self.config_entry.data))
+                    servers = [item for item in stored if item.get("name") != name]
+                    servers.append(
+                        {
+                            "name": name,
+                            "host": host,
+                            "port": port,
+                            "token": code,
+                            "verified": True,
+                        }
                     )
-                    for dev_id, dev in devices.items()
-                ],
-                mode=SelectSelectorMode.DROPDOWN,
-            )
-        )
+                    new_data["screen_servers"] = servers
+                    return self._update_entry(new_data)
+
         schema = vol.Schema(
             {
                 vol.Required("server_name", default=current.get("name") or "Mac mini"): str,
                 vol.Required("host", default=current.get("host") or "192.168.2.20"): str,
                 vol.Required("port", default=int(current.get("port") or 8090)): int,
                 vol.Required("screen_code", default=current.get("token") or ""): TextSelector(),
-                vol.Required("device_id", default=attached): device_select,
             }
         )
         return self.async_show_form(
-            step_id="screen_colors",
+            step_id="screen_server",
             data_schema=schema,
             errors=errors,
             description_placeholders={
-                "msg": "Add the Mac that runs Screen Edges and choose which strip follows it. "
-                "The token is in the Screen Edges config file on that Mac. "
-                "Zone lengths and edges are set on the strip, not here. "
-                "Use the same server name to attach another strip."
+                "msg": "Check the address and token, then test the connection. "
+                "A successful test saves the server. "
+                "Each LED strip then chooses this server on its own page. "
+                "More than one strip can follow the same server."
             },
         )
 
