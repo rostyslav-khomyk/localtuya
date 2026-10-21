@@ -23,7 +23,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.util import color as color_util
 
 from .battletron_zones import ZoneSender, run_zone_loop
-from .const import CONF_COLOR_MODE, CONF_LOCAL_KEY, DOMAIN
+from .const import CONF_COLOR, CONF_COLOR_MODE, CONF_LOCAL_KEY, DOMAIN
 from .screen_layout import zone_counts
 
 _LOGGER = logging.getLogger(__name__)
@@ -82,6 +82,14 @@ def _mode_dp(device: dict):
     if not ent:
         return None
     return ent.get(CONF_COLOR_MODE) or ent.get("color_mode")
+
+
+def _color_dp(device: dict):
+    """Solid colour DP — cleared to black when arming zones."""
+    ent = _light_entity(device)
+    if not ent:
+        return None
+    return ent.get(CONF_COLOR) or ent.get("color")
 
 
 class ZonePaintHub:
@@ -283,24 +291,32 @@ class ZonePaintHub:
         )
 
     async def _power_one(self, device_id: str):
-        """Arm a strip for zone UDP.
+        """Power the strip on for zone UDP, clear solid colour, hold TCP closed.
 
-        Do **not** set power/colour over TCP — that writes DP24 and the strip
-        shows solid orange whenever UDP stalls. Mac strip.js never opens TCP;
-        a direct ZoneSender from the HA host paints RGB the same way. We only
-        hold the colour TCP link closed so localtuya cannot fight the painter.
+        Stop-sync turns the strip off over TCP. Without powering back on here,
+        UDP frames are accepted but the LEDs stay dark. Colour DP is set black
+        so the last orange solid colour cannot flash through.
         """
         if device_id in self._powered:
             return
+        device = self._device(device_id)
         tuya = _tuya_device(self.hass, self.entry, device_id)
-        if tuya is not None:
-            try:
-                tuya._pending_status = {}
-                await tuya.async_hold_tcp()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Zone TCP hold %s: %s", device_id[:8], err)
-        self._powered.add(device_id)
-        _LOGGER.info("Zone strip %s armed (UDP-only, TCP held)", device_id[:8])
+        power = _power_dp(device) if device else None
+        if tuya is None or power is None:
+            return
+        mode = _mode_dp(device) if device else None
+        color = _color_dp(device) if device else None
+        try:
+            await tuya.async_power_for_zones(power, mode, color)
+            self._powered.add(device_id)
+            _LOGGER.info(
+                "Zone strip %s powered (mode_dp=%s color_dp=%s→black)",
+                device_id[:8],
+                mode,
+                color,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not power zone strip %s: %s", device_id[:8], err)
 
     async def _power_off(self, device_id: str):
         """Best-effort TCP power off after black UDP frames; keep TCP held."""

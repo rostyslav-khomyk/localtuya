@@ -390,14 +390,12 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._pending_status = {}
         await self.async_connect()
 
-    async def async_power_for_zones(self, power_dp, mode_dp=None) -> None:
-        """Turn the strip on in colour mode, then drop the color link.
+    async def async_power_for_zones(self, power_dp, mode_dp=None, color_dp=None) -> None:
+        """Turn the strip on for zone UDP, then drop the colour TCP link.
 
-        Must run before the zone link starts. Music mode starts the mic
-        effect and hides zone frames. Colour mode with TCP closed matches
-        the Mac UDP clients: power stays on, solid-colour updates stop,
-        and zone frames can paint. The saved colour datapoint is not
-        rewritten beyond switching work_mode back to colour when needed.
+        Music mode hides zone frames. Power must be on or the LEDs stay dark
+        even while UDP frames are accepted. Setting colour_data to black stops
+        the last solid colour (often orange) from showing if UDP stalls briefly.
         """
         self._zone_tcp_window = True
         self._hold_tcp = False
@@ -410,13 +408,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 if mode_dp is not None:
                     mode = int(mode_dp) if str(mode_dp).isdigit() else mode_dp
                     states[mode] = "colour"
+                if color_dp is not None:
+                    color = int(color_dp) if str(color_dp).isdigit() else color_dp
+                    # HSV hex HHHHSSSSVVVV — value 0 = black fallback under zones.
+                    states[color] = "000000000000"
                 await self.set_dps(states)
-                await asyncio.sleep(0.5)
-                self.info("Strip powered for screen sync")
+                await asyncio.sleep(0.35)
+                self.info("Strip powered for zone UDP")
             elif power_dp is not None:
-                self.warning("Could not reach the strip to power it for screen sync")
+                self.warning("Could not reach the strip to power it for zone UDP")
         except Exception as err:
-            self.warning(f"Could not power the strip for screen sync: {err}")
+            self.warning(f"Could not power the strip for zone UDP: {err}")
         finally:
             self._zone_tcp_window = False
             await self.async_hold_tcp()
