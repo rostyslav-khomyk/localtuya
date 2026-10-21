@@ -8,7 +8,7 @@
 
 __A Home Assistant custom Integration for local handling of Tuya-based devices.__
 
-This fork tracks [hass-localtuya](https://github.com/xZetsubou/hass-localtuya), including Tuya protocol 3.5. It adds Hyperion screen-edge zones for Battletron strips. Setup is in [docs/SCREEN_EDGES.md](docs/SCREEN_EDGES.md). The grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges).
+This fork tracks [hass-localtuya](https://github.com/xZetsubou/hass-localtuya), including Tuya protocol 3.5. It adds **Battletron zone lights**: each zone is a normal HA RGB light painted over UDP `:40001` (parent solid light disabled while zones exist). Setup is in [docs/SCREEN_EDGES.md](docs/SCREEN_EDGES.md). The Mac grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges) (HA REST → zone entities; no Hyperion).
 
 ### **Usage and setup [Documentation](https://xzetsubou.github.io/hass-localtuya/)**
 

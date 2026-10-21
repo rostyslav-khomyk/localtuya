@@ -271,6 +271,10 @@ class ZonePaintHub:
         await self._stop_loop()
         await asyncio.sleep(0.1)
         self.sender = ZoneSender()
+        # Socket/session was dropped — must re-assert TCP power. Leaving ids in
+        # `_powered` made `_power_one` no-op after SE pause/resume or dual-strip
+        # restart, so UDP negotiated while LEDs stayed dark (DP20 off / DP24 black).
+        self._powered.clear()
         for did in device_ids:
             device = self._device(did)
             if not device:

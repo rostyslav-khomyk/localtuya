@@ -61,13 +61,8 @@ def _route(host: str) -> str:
 
 
 def _targets(host: str, bind_ip: str) -> list[str]:
-    """Match strip.js: subnet broadcast first, then the strip unicast."""
-    parts = (bind_ip if bind_ip != "0.0.0.0" else host).split(".")
-    targets: list[str] = []
-    if len(parts) == 4:
-        targets.append(".".join(parts[:3] + ["255"]))
-    targets.append(host)
-    return list(dict.fromkeys(targets))
+    """Send once: duplicate negotiations can replace the strip's session key."""
+    return [host]
 
 
 class ZoneSender:
@@ -91,11 +86,12 @@ class ZoneSender:
             "key": key,
             "host": host,
             "bind_ip": bind_ip,
-            # Match strip.js: subnet broadcast first, then unicast.
+            # A negotiation must reach the controller only once.
             "targets": _targets(host, bind_ip),
             "controller_crc": controller_crc,
             "device_crc": device_crc,
             "session": None,
+            "last_negotiate": None,
             "sequence": 1,
             "token": token,
             "rnd": rnd,
@@ -146,8 +142,13 @@ class ZoneSender:
     def negotiate(self, device_id: str) -> None:
         with self._io:
             dev = self._devices.get(device_id)
-            if not dev:
+            if not dev or dev["session"]:
                 return
+            now = time.monotonic()
+            # The immediate update and painter share this handshake.
+            if dev["last_negotiate"] is not None and now - dev["last_negotiate"] < 1.0:
+                return
+            dev["last_negotiate"] = now
             plain = b"\x00\x00\x00\x00" + dev["token"] + dev["rnd"]
             self._send_unlocked(dev, NEGOTIATE, plain, FIXED_KEY)
 

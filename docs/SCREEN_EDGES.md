@@ -1,58 +1,57 @@
-# Screen edges and local keys
+# Battletron zone lights (screen edges)
 
-This fork is [hass-localtuya](https://github.com/xZetsubou/hass-localtuya), which already speaks Tuya protocol 3.5. The additions here attach those lights to a Hyperion screen-edge stream.
+This fork is [hass-localtuya](https://github.com/xZetsubou/hass-localtuya) with Tuya protocol 3.5, plus **Battletron zone lights**: each configured zone is a normal Home Assistant RGB light. Colour and brightness are painted over **UDP 40001** (same framing as the Mac `strip.js` client). Solid colour TCP is held closed while zones are active so music/colour DP does not fight the UDP frames.
 
-The Mac grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges).
+The Mac grabber is [screen-edges](https://github.com/rostyslav-khomyk/screen-edges). It pushes edge colours to those zone entities over the HA **REST** API (`light.turn_on`). Hyperion is not used.
 
-## What stays the same
+```
+Screen Edges  --HA REST-->  light.*_zone_*  -->  localtuya UDP :40001  -->  Battletron strip
+```
 
-The light entity still does what the controller already does:
+## Configure zones on a strip
 
-- on, off, and one solid color
-- scenes
-- music
+1. Add the strip to LocalTuya (local key + protocol `3.5`; see below).
+2. In the device options, add zones with length (cm) and edge (`left` / `top` / `right` / `bottom`).
+3. Each zone appears as a colour light (e.g. `light.…_zone_1_left`). The parent solid light is disabled while zones exist.
 
-Screen sync is a separate switch. Turn it off before using scenes or music. The zone packets and the music mode will otherwise fight over the strip.
-
-## Add a screen server
-
-1. Install and start `screen-edges` on the Mac. Copy the token from `~/Library/Application Support/ScreenEdges/config.json`.
-2. In Home Assistant, open the LocalTuya options and choose **Screen edge colors**.
-3. Name the server, set the Mac's address, port `8090`, and the token.
-4. Pick the strip. Zone 1 is the controller end of the strip.
-
-The 110 cm monitor strip, controller on the left:
+Example — 110 cm monitor strip, controller on the left:
 
 | Zone | Edge | Length |
 | --- | --- | --- |
 | 1 | left | 27 cm |
 | 2 | top | 57 cm |
 | 3 | right | 27 cm |
-| 4 |  | 0 |
 
-A second strip can use the same server name. Example: a 300 cm cove that only echoes the bottom of the ultrawide is one zone, edge `bottom`, length 300. Sliders on the device change the lengths later. A length of 0 drops that zone. There are four color slots, so four zones is the maximum.
+A 300 cm desk/cove strip can be a single zone: edge `bottom`, length 300.
 
-Saving this step sets `local_only` on that strip. Home Assistant will not ask the Tuya cloud for a new local key afterwards.
+Turning a zone on/off or changing its colour paints that segment immediately. Turning the last zone off blacks out the strip and powers it off over TCP.
+
+## How zone UDP stays lit
+
+- On paint start, LocalTuya powers the strip (`DP20`), sets work mode to `colour`, clears the solid colour DP to black, then holds the colour TCP link closed.
+- One shared UDP socket binds on the HA host (port `40001`). Frames go **unicast** to each strip’s LAN address (broadcast is avoided: duplicate negotiations can replace the strip’s session key).
+- Immediate HA updates and the background painter share one handshake; negotiate is debounced (~1 s) and skipped once a session exists.
+- When the painter restarts (new socket / second strip joins), `_powered` is cleared so TCP power is re-asserted. Otherwise UDP can negotiate while the LEDs stay dark.
 
 ## Get the local key
 
-Do this once per device, from a browser, while logged into the Tuya IoT console. The data center has to stay Central Europe, the same region as the Smart Life account.
+Do this once per device from a browser, logged into the Tuya IoT console. Keep the data center matching the Smart Life account (e.g. Central Europe).
 
 1. Open [platform.tuya.com](https://platform.tuya.com) and sign in.
-2. Open the cloud project. The industry is Smart Home. Confirm the data center is Central Europe.
-3. Link the Smart Life app account to the project if it is not linked yet.
-4. The project needs the IoT Core API. The reminder on the project overview is not the same thing. IoT Core has to be in service.
-5. Open API Explorer. Choose **Query Device Details**. That is the single-device call, not the bulk call.
-6. Request `GET /v2.0/cloud/thing/{device_id}`.
-7. Copy `local_key` exactly. Characters such as `?`, `@`, `>`, `$`, `[`, and `{` are part of the key.
+2. Open the cloud project (Smart Home industry). Confirm the data center.
+3. Link the Smart Life app account if needed. Ensure **IoT Core** is in service.
+4. Open **API Explorer** → **Query Device Details** (single-device, not bulk).
+5. Call `GET /v2.0/cloud/thing/{device_id}` and copy `local_key` exactly (punctuation is significant).
 
 In LocalTuya, add the device by hand:
 
-- host: the strip's LAN address
-- device id: the `id` from that same response
-- local key: the value you copied
-- protocol: `3.5`
+- host: strip LAN address  
+- device id / local key from that response  
+- protocol: `3.5`  
+- `no_cloud` / local-only is fine once every device has a key  
 
-Leave the cloud account empty (`no_cloud`) if every device already has a key. After **Screen edge colors** saves, that strip stays on local traffic only.
+Do not remove the device from Smart Life until local control works — removing it can issue a new local key. After a factory reset, fetch the key again the same way.
 
-Do not remove the device from Smart Life until local control is already working. Removing it can issue a new local key.
+## Screen Edges (Mac)
+
+Install and map zone lights as described in the [screen-edges README](https://github.com/rostyslav-khomyk/screen-edges). Sync pushes REST `light.turn_on` only; LocalTuya owns UDP to the strip.
