@@ -393,6 +393,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     connect_to_devices = _setup_devices(entry.data[CONF_DEVICES])
 
     await async_remove_orphan_entities(hass, entry)
+    from .screen_sync import _drop_extra_zones
+
+    _drop_extra_zones(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
 
     from .screen_sync import async_start_hub

@@ -82,6 +82,14 @@
                     "screen_code": "Token"
                 }
             },
+            "screen_server_remove": {
+                "title": "Remove screen server",
+                "description": "{msg}",
+                "submit": "Remove",
+                "data": {
+                    "server_name": "Saved server"
+                }
+            },
             "add_device": {
                 "title": "Choose device to configure",
                 "description": "Compatible Tuya devices on your local network are discovered automatically once they have been set-up in the Tuya app. If you can't see the device you expected, choose `Add device manually` from the dropdown.",

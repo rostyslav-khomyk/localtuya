@@ -318,7 +318,8 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     def is_on(self):
         """Check if Tuya light is on.
 
-        Screen sync and this switch cannot both be on.
+        Screen sync turns this switch off so the two do not both drive the strip.
+        Turning this switch on turns screen sync off. Both may stay off.
         """
         if self._screen_sync_active():
             return False

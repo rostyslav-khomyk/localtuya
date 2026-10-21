@@ -73,8 +73,18 @@ class ScreenHub:
 
     async def start(self):
         self.refresh_devices()
+        for dev_id, device in self.entry.data.get(CONF_DEVICES, {}).items():
+            if _sync(device).get("enabled"):
+                await _release_solid_color(self.hass, self.entry, dev_id)
+        used = {
+            _sync(device).get("server")
+            for device in self.entry.data.get(CONF_DEVICES, {}).values()
+            if _sync(device).get("enabled")
+        }
         for server in _servers(self.entry):
-            name = server["name"]
+            name = server.get("name")
+            if name not in used:
+                continue
             cache = self.edges.setdefault(name, EdgeCache())
             if cache.task is None or cache.task.done():
                 cache.task = self.entry.async_create_background_task(
@@ -194,10 +204,43 @@ async def _persist_and_reload(hass, entry):
 
 
 def _light_power_dp(device):
+    power, _color = _light_dps(device)
+    return power
+
+
+def _light_dps(device):
+    """Power DP and the solid-color DP for the strip's light."""
     for entity in device.get("entities") or []:
         if str(entity.get("platform", "")).lower() == "light":
-            return entity.get("id")
-    return None
+            return entity.get("id"), entity.get("color")
+    return None, None
+
+
+async def _release_solid_color(hass, entry, device_id):
+    """Drop the stored solid color so zone frames can own the LEDs.
+
+    The color link stays closed afterwards. Power is left on, because the
+    strip ignores zone frames when it is switched off.
+    """
+    tuya = _tuya_device(hass, entry, device_id)
+    device = entry.data[CONF_DEVICES][device_id]
+    power, color = _light_dps(device)
+    if not tuya or power is None:
+        return
+    tuya._zone_tcp_window = True
+    try:
+        await tuya.async_connect()
+        await tuya.set_dp(False, power)
+        await asyncio.sleep(0.4)
+        states = {str(power): True}
+        if color:
+            states[str(color)] = "000000000000"
+        await tuya.set_dps(states)
+    except Exception as err:
+        _LOGGER.warning("Could not hand %s to screen sync: %s", device_id, err)
+    finally:
+        tuya._zone_tcp_window = False
+        await tuya.abort_connect()
 
 
 def _tuya_device(hass, entry, device_id):
@@ -222,17 +265,8 @@ class ScreenSyncSwitch(SwitchEntity):
         self._attr_device_info = _device_info(device_id, device)
 
     async def async_turn_on(self, **kwargs):
-        """Screen sync owns the strip. The light switch turns off."""
+        """Screen sync takes the strip. The light switch turns off."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
-        tuya = _tuya_device(self.hass, self._entry, self._device_id)
-        power = _light_power_dp(device)
-        if tuya and power is not None:
-            if not tuya.connected:
-                await tuya.async_connect()
-            try:
-                await tuya.set_dp(True, power)
-            except Exception as err:
-                _LOGGER.warning("Could not power %s for screen sync: %s", self._device_id, err)
         sync = _sync(device)
         sync["enabled"] = True
         device["screen_sync"] = sync
@@ -241,10 +275,23 @@ class ScreenSyncSwitch(SwitchEntity):
         await _persist_and_reload(self.hass, self._entry)
 
     async def async_turn_off(self, **kwargs):
+        """Stop screen sync and leave the light off. Both switches may be off."""
         device = self._entry.data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         sync["enabled"] = False
         device["screen_sync"] = sync
+        _save(self.hass, self._entry)
+        tuya = _tuya_device(self.hass, self._entry, self._device_id)
+        power = _light_power_dp(device)
+        if tuya and power is not None:
+            tuya._zone_tcp_window = True
+            try:
+                await tuya.async_connect()
+                await tuya.set_dp(False, power)
+            except Exception as err:
+                _LOGGER.warning("Could not turn %s off: %s", self._device_id, err)
+            finally:
+                tuya._zone_tcp_window = False
         self._attr_is_on = False
         self.schedule_update_ha_state()
         await _persist_and_reload(self.hass, self._entry)
@@ -259,7 +306,11 @@ class ScreenServerSelect(SelectEntity):
     def __init__(self, entry, device_id, device):
         self._entry = entry
         self._device_id = device_id
-        names = [server.get("name") for server in _servers(entry) if server.get("token")]
+        names = [
+            server.get("name")
+            for server in _servers(entry)
+            if server.get("token") and server.get("verified")
+        ]
         current = _sync(device).get("server")
         if current and current not in names:
             names.insert(0, current)
@@ -387,7 +438,26 @@ def _strip_devices(entry):
         yield device_id, device
 
 
+def _drop_extra_zones(hass, entry):
+    """Remove zone entities that are no longer part of a strip."""
+    from homeassistant.helpers import entity_registry as er
+
+    counts = {device_id: len(_zones(device)) for device_id, device in _strip_devices(entry)}
+    registry = er.async_get(hass)
+    for entity in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
+        unique_id = entity.unique_id or ""
+        marker = "_zone_"
+        if marker not in unique_id or not unique_id.startswith("local_"):
+            continue
+        head, _, tail = unique_id.partition(marker)
+        device_id = head[len("local_") :]
+        index = tail.split("_", 1)[0]
+        if device_id in counts and index.isdigit() and int(index) >= counts[device_id]:
+            registry.async_remove(entity.entity_id)
+
+
 async def async_add_switches(hass, entry, async_add_entities):
+    _drop_extra_zones(hass, entry)
     async_add_entities(
         [ScreenSyncSwitch(entry, device_id, device) for device_id, device in _strip_devices(entry)]
     )

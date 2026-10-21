@@ -92,6 +92,7 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._pending_status: dict[str, dict[str, Any]] = {}
 
         self.is_closing = False
+        self._zone_tcp_window = False
         self._task_connect: asyncio.Task | None = None
         self._task_reconnect: asyncio.Task | None = None
         self._task_shutdown_entities: asyncio.Task | None = None
@@ -157,6 +158,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
 
     def _screen_sync_blocks_tcp(self) -> bool:
         """Screen sync uses the zone link. The color connection has to stay closed."""
+        if self._zone_tcp_window:
+            return False
         try:
             device = self._entry.data.get(CONF_DEVICES, {}).get(self.id) or {}
         except (AttributeError, TypeError):

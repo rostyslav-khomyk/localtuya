@@ -303,6 +303,8 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
 
         if user_input is not None:
             self._screen_pick = user_input["server_pick"]
+            if self._screen_pick == "remove":
+                return await self.async_step_screen_server_remove()
             return await self.async_step_screen_server()
 
         stored = list(self.config_entry.data.get("screen_servers") or [])
@@ -324,6 +326,8 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
                 SelectOptionDict(value=f"saved:{item.get('name')}", label=item.get("name") or item.get("host"))
             )
         options.append(SelectOptionDict(value="manual", label="Enter manually"))
+        if stored:
+            options.append(SelectOptionDict(value="remove", label="Remove a saved server"))
         default = options[0]["value"]
         found_msg = (
             "Choose a Hyperion server found on the network."
@@ -339,6 +343,49 @@ class LocalTuyaOptionsFlowHandler(OptionsFlow):
             ),
             last_step=False,
             description_placeholders={"msg": found_msg},
+        )
+
+    async def async_step_screen_server_remove(self, user_input=None):
+        """Delete a saved screen server. Strips then use another verified one."""
+        stored = list(self.config_entry.data.get("screen_servers") or [])
+        names = [item.get("name") or item.get("host") for item in stored]
+        if user_input is not None:
+            name = user_input["server_name"]
+            new_data = copy.deepcopy(dict(self.config_entry.data))
+            servers = [item for item in stored if item.get("name") != name]
+            fallback = next(
+                (item.get("name") for item in servers if item.get("verified") and item.get("token")),
+                None,
+            )
+            for device in new_data.get(CONF_DEVICES, {}).values():
+                sync = device.get("screen_sync") or {}
+                if sync.get("server") != name:
+                    continue
+                sync["server"] = fallback or ""
+                if not fallback:
+                    sync["enabled"] = False
+                device["screen_sync"] = sync
+            new_data["screen_servers"] = servers
+            return self._update_entry(new_data)
+
+        if not names:
+            return self.async_abort(reason="screen_down")
+        return self.async_show_form(
+            step_id="screen_server_remove",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("server_name", default=names[0]): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[SelectOptionDict(value=name, label=name) for name in names],
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                }
+            ),
+            description_placeholders={
+                "msg": "The server is removed from every strip. "
+                "A strip that was using it switches to another verified server when one exists."
+            },
         )
 
     async def async_step_screen_server(self, user_input=None):
