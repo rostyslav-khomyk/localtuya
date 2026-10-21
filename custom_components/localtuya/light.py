@@ -312,7 +312,7 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
         """Stay usable while screen sync is holding the local connection closed."""
         if self._screen_sync_active():
             return True
-        return super().available()
+        return bool(super().available)
 
     @property
     def is_on(self):
