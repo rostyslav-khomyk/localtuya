@@ -294,6 +294,8 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                     update_localkey = True
 
         # Connect and configure the entities, at this point the device should be ready to get commands.
+        if self.connected and self._screen_sync_blocks_tcp():
+            await self.abort_connect()
         if self.connected and not self.is_closing:
             self.debug(f"Success: connected to: {host}", force=True)
             # Attempt to restore status for all entities that need to first set

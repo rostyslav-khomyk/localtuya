@@ -640,8 +640,9 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         await self._device.set_dps(states)
         if released_sync:
-            entry_id = self._device._entry.entry_id
-            self.hass.async_create_task(self.hass.config_entries.async_reload(entry_id))
+            from .screen_sync import _poke
+
+            _poke(self._device)
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""
