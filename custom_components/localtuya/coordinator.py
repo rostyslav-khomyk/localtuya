@@ -390,12 +390,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         await self.async_connect()
 
     async def async_power_for_zones(self, power_dp, mode_dp=None) -> None:
-        """Turn the strip on, leave colour mode, then drop the color link.
+        """Turn the strip on in colour mode, then drop the color link.
 
-        Must run before the zone link starts. Leaving the strip in solid
-        colour mode keeps the last purple/red on the LEDs and ignores zone
-        frames. Music mode keeps power on and lets the zone link paint.
-        The saved colour datapoint is not rewritten.
+        Must run before the zone link starts. Music mode starts the mic
+        effect and hides zone frames. Colour mode with TCP closed matches
+        the Mac UDP clients: power stays on, solid-colour updates stop,
+        and zone frames can paint. The saved colour datapoint is not
+        rewritten beyond switching work_mode back to colour when needed.
         """
         self._zone_tcp_window = True
         self._hold_tcp = False
@@ -407,9 +408,9 @@ class TuyaDevice(TuyaListener, ContextualLogger):
                 states = {dp: True}
                 if mode_dp is not None:
                     mode = int(mode_dp) if str(mode_dp).isdigit() else mode_dp
-                    states[mode] = "music"
+                    states[mode] = "colour"
                 await self.set_dps(states)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.5)
                 self.info("Strip powered for screen sync")
             elif power_dp is not None:
                 self.warning("Could not reach the strip to power it for screen sync")
