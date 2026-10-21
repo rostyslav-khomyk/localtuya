@@ -235,6 +235,12 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
         while not stop.is_set():
             if not sender._devices:
                 break
+            # paint_now() may negotiate first; treat an existing session as ready
+            # or the thread never paints and the strip falls back to TCP colour.
+            for device_id in device_ids:
+                dev = sender._devices.get(device_id)
+                if dev and dev.get("session"):
+                    ready.add(device_id)
             now = time.monotonic()
             if now - last_negotiate >= 1.0:
                 for device_id in device_ids:
