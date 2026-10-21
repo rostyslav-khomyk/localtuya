@@ -114,7 +114,8 @@ class ScreenHub:
             device = self.entry.data[CONF_DEVICES][dev_id]
             tuya = _tuya_device(self.hass, self.entry, dev_id)
             if tuya is not None:
-                await tuya.async_power_for_zones(_light_power_dp(device))
+                power, mode = _light_dps(device)
+                await tuya.async_power_for_zones(power, mode)
 
     async def restart_zones(self, *, power: bool = False):
         """Restart zone painting. Set power=True only when a strip may be off."""
@@ -227,10 +228,16 @@ async def _persist_and_reload(hass, entry):
 
 
 def _light_power_dp(device):
+    power, _mode = _light_dps(device)
+    return power
+
+
+def _light_dps(device):
+    """Power DP and work-mode DP for the strip light."""
     for entity in device.get("entities") or []:
         if str(entity.get("platform", "")).lower() == "light":
-            return entity.get("id")
-    return None
+            return entity.get("id"), entity.get("color_mode")
+    return None, None
 
 
 def _poke(tuya):
@@ -275,7 +282,8 @@ class ScreenSyncSwitch(SwitchEntity):
         _save(self.hass, self._entry)
         tuya = _tuya_device(self.hass, self._entry, self._device_id)
         if tuya is not None:
-            await tuya.async_power_for_zones(_light_power_dp(device))
+            power, mode = _light_dps(device)
+            await tuya.async_power_for_zones(power, mode)
         hub = _hubs(self.hass).get(self._entry.entry_id)
         if hub:
             # Power already done for this strip. Keep other strips' TCP closed.

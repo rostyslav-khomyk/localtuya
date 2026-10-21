@@ -389,12 +389,13 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._pending_status = {}
         await self.async_connect()
 
-    async def async_power_for_zones(self, power_dp) -> None:
-        """Turn the strip on, then drop the color link so zone frames can paint.
+    async def async_power_for_zones(self, power_dp, mode_dp=None) -> None:
+        """Turn the strip on, leave colour mode, then drop the color link.
 
-        Must run before the zone link starts. Opening this color link while
-        zone frames are flowing makes the strip drop the zone session and
-        stay dark. The saved color is left alone.
+        Must run before the zone link starts. Leaving the strip in solid
+        colour mode keeps the last purple/red on the LEDs and ignores zone
+        frames. Music mode keeps power on and lets the zone link paint.
+        The saved colour datapoint is not rewritten.
         """
         self._zone_tcp_window = True
         self._hold_tcp = False
@@ -403,7 +404,11 @@ class TuyaDevice(TuyaListener, ContextualLogger):
             await self.async_connect()
             if power_dp is not None and self.connected:
                 dp = int(power_dp) if str(power_dp).isdigit() else power_dp
-                await self.set_dp(True, dp)
+                states = {dp: True}
+                if mode_dp is not None:
+                    mode = int(mode_dp) if str(mode_dp).isdigit() else mode_dp
+                    states[mode] = "music"
+                await self.set_dps(states)
                 await asyncio.sleep(1.0)
                 self.info("Strip powered for screen sync")
             elif power_dp is not None:
