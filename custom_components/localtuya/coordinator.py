@@ -158,16 +158,17 @@ class TuyaDevice(TuyaListener, ContextualLogger):
         self._entities.extend(entities)
 
     def _screen_sync_blocks_tcp(self) -> bool:
-        """Screen sync uses the zone link. The color connection has to stay closed."""
+        """Zone lights use UDP. Keep the colour TCP link closed while they paint."""
         if self._zone_tcp_window:
             return False
         if self._hold_tcp:
             return True
         try:
-            device = self._entry.data.get(CONF_DEVICES, {}).get(self.id) or {}
-        except (AttributeError, TypeError):
+            from .zone_lights import zones_painting
+
+            return zones_painting(self.hass, self._entry, self.id)
+        except (AttributeError, TypeError, ImportError):
             return False
-        return bool((device.get("screen_sync") or {}).get("enabled"))
 
     async def async_connect(self, _now=None) -> None:
         """Connect to device if not already connected."""

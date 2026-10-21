@@ -302,15 +302,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         return attributes
 
-    def _screen_sync_active(self):
-        from .screen_sync import screen_sync_enabled
+    def _zones_active(self):
+        from .zone_lights import zones_painting
 
-        return screen_sync_enabled(self._device._entry, self._device.id)
+        return zones_painting(self.hass, self._device._entry, self._device.id)
 
     @property
     def available(self) -> bool:
-        """Stay usable while screen sync is holding the local connection closed."""
-        if self._screen_sync_active():
+        """Stay usable while zone lights hold the local connection closed."""
+        if self._zones_active():
             return True
         return bool(super().available)
 
@@ -318,10 +318,10 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     def is_on(self):
         """Check if Tuya light is on.
 
-        Screen sync turns this switch off so the two do not both drive the strip.
-        Turning this switch on turns screen sync off. Both may stay off.
+        Zone lights turn this switch off so both do not drive the strip.
+        Turning this switch on releases the zones. Both may stay off.
         """
-        if self._screen_sync_active():
+        if self._zones_active():
             return False
         return self._state
 
@@ -549,11 +549,11 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
     async def async_turn_on(self, **kwargs):
         """Turn on or control the light."""
         released_sync = False
-        if self._screen_sync_active():
-            from .screen_sync import async_release_screen_sync
+        if self._zones_active():
+            from .zone_lights import async_release_zones
 
             released_sync = True
-            await async_release_screen_sync(self._device)
+            await async_release_zones(self._device)
         states = {}
         if not self.is_on or self._write_only:
             states[self._dp_id] = True
@@ -640,16 +640,15 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
 
         await self._device.set_dps(states)
         if released_sync:
-            from .screen_sync import _poke
-
-            _poke(self._device)
+            for entity in list(getattr(self._device, "_entities", ())):
+                entity.schedule_update_ha_state()
 
     async def async_turn_off(self, **kwargs):
         """Turn Tuya light off."""
-        if self._screen_sync_active():
-            from .screen_sync import async_release_screen_sync
+        if self._zones_active():
+            from .zone_lights import async_release_zones
 
-            await async_release_screen_sync(self._device)
+            await async_release_zones(self._device)
         self._state = False
         await self._device.set_dp(False, self._dp_id)
 
@@ -699,4 +698,12 @@ class LocalTuyaLight(LocalTuyaEntity, LightEntity):
                 self._state = self._last_state
 
 
-async_setup_entry = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)
+_setup_tuya_lights = partial(async_setup_entry, DOMAIN, LocalTuyaLight, flow_schema)
+
+
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    """Set up the strip light and one colour light per Battletron zone."""
+    await _setup_tuya_lights(hass, config_entry, async_add_entities)
+    from .zone_lights import async_add_zone_lights
+
+    await async_add_zone_lights(hass, config_entry, async_add_entities)
