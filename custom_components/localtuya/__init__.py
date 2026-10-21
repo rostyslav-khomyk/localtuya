@@ -435,7 +435,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def update_listener(hass: HomeAssistant, config_entry: ConfigEntry):
-    """Update listener."""
+    """Reload after options/device edits. Screen-sync toggles skip this."""
+    skips = hass.data.get(DOMAIN, {}).get("_skip_reload_entries")
+    if isinstance(skips, set) and config_entry.entry_id in skips:
+        skips.discard(config_entry.entry_id)
+        return
     await hass.config_entries.async_reload(config_entry.entry_id)
 
 

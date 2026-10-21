@@ -126,6 +126,9 @@ class ScreenHub:
             except asyncio.CancelledError:
                 pass
             self._run = None
+        # Close before rebuilding so UDP 40001 is free for the next painter.
+        self.sender.close()
+        await asyncio.sleep(0.2)
         self.refresh_devices()
         self.ensure_follows()
         device_ids = list(self.sender._devices)
@@ -219,10 +222,18 @@ def _zones(device):
 
 
 def _save(hass, entry):
+    """Persist screen-sync settings without reloading the whole integration.
+
+    A full reload races two UDP binds on :40001 (Errno 98 Address in use).
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    skips = domain_data.setdefault("_skip_reload_entries", set())
+    skips.add(entry.entry_id)
     hass.config_entries.async_update_entry(entry, data=dict(entry.data))
 
 
 async def _persist_and_reload(hass, entry):
+    """Persist then reload so zone entities are created/removed."""
     _save(hass, entry)
     await hass.config_entries.async_reload(entry.entry_id)
 

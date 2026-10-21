@@ -100,12 +100,13 @@ class ZoneSender:
         }
 
     def close(self) -> None:
-        if self._sock:
+        sock = self._sock
+        self._sock = None
+        if sock:
             try:
-                self._sock.close()
+                sock.close()
             except OSError:
                 pass
-            self._sock = None
         self._devices.clear()
 
     def _socket(self) -> socket.socket:
@@ -115,13 +116,27 @@ class ZoneSender:
             (dev["bind_ip"] for dev in self._devices.values() if dev.get("bind_ip")),
             "0.0.0.0",
         )
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind((bind_ip, PORT))
-        sock.settimeout(0.05)
-        self._sock = sock
-        _LOGGER.info("Zone socket on %s for %s", bind_ip, ",".join(self._devices))
-        return sock
+        last_err: OSError | None = None
+        for attempt in range(12):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            try:
+                sock.bind((bind_ip, PORT))
+                sock.settimeout(0.05)
+                self._sock = sock
+                _LOGGER.info("Zone socket on %s for %s", bind_ip, ",".join(self._devices))
+                return sock
+            except OSError as err:
+                last_err = err
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                # Previous painter may still be releasing UDP 40001.
+                time.sleep(0.1 * (attempt + 1))
+        assert last_err is not None
+        raise last_err
 
     def negotiate(self, device_id: str) -> None:
         dev = self._devices[device_id]
@@ -231,7 +246,8 @@ def _zone_thread(sender: ZoneSender, device_ids: list[str], color_fn, interval: 
                 sender.send_colors(device_id, colors, counts)
             stop.wait(interval)
     finally:
-        sender.close()
+        # Leave socket close to the async caller so restart can wait on it.
+        pass
 
 
 async def run_zone_loop(sender: ZoneSender, device_ids, color_fn, interval=0.125):
@@ -243,10 +259,11 @@ async def run_zone_loop(sender: ZoneSender, device_ids, color_fn, interval=0.125
     )
     try:
         await task
-    except asyncio.CancelledError:
+    finally:
         stop.set()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=2)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pass
-        raise
+        if not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+        sender.close()
