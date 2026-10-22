@@ -4,6 +4,8 @@ Screen Edges (or HA / HomeKit) maps colours onto the zone *light* entities.
 There is no edge mapping here — that belongs in Screen Edges.
 """
 
+import copy
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.const import CONF_DEVICES, UnitOfLength
@@ -34,15 +36,17 @@ def _assert_layout_editable(hass, entry, device_id):
         hub.assert_manual(device_id)
 
 
-def _save(hass, entry):
+def _save(hass, entry, data):
     domain_data = hass.data.setdefault(DOMAIN, {})
     skips = domain_data.setdefault("_skip_reload_entries", set())
+    if data == entry.data:
+        return
     skips.add(entry.entry_id)
-    hass.config_entries.async_update_entry(entry, data=dict(entry.data))
+    hass.config_entries.async_update_entry(entry, data=data)
 
 
-async def _persist_and_reload(hass, entry):
-    _save(hass, entry)
+async def _persist_and_reload(hass, entry, data):
+    _save(hass, entry, data)
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -95,11 +99,12 @@ class ZoneLengthNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         _assert_layout_editable(self.hass, self._entry, self._device_id)
-        zones = _sync(self._entry.data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
+        data = copy.deepcopy(dict(self._entry.data))
+        zones = _sync(data[CONF_DEVICES][self._device_id]).setdefault("zones", [])
         zones[self._index]["cm"] = max(1, int(value))
         self._attr_native_value = zones[self._index]["cm"]
         self.schedule_update_ha_state()
-        _save(self.hass, self._entry)
+        _save(self.hass, self._entry, data)
 
 
 class AddZoneButton(ButtonEntity):
@@ -114,7 +119,8 @@ class AddZoneButton(ButtonEntity):
 
     async def async_press(self) -> None:
         _assert_layout_editable(self.hass, self._entry, self._device_id)
-        device = self._entry.data[CONF_DEVICES][self._device_id]
+        data = copy.deepcopy(dict(self._entry.data))
+        device = data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         zones = list(sync.get("zones") or [])
         if len(zones) >= 4:
@@ -124,7 +130,7 @@ class AddZoneButton(ButtonEntity):
         sync.pop("enabled", None)
         sync.pop("server", None)
         device["screen_sync"] = sync
-        await _persist_and_reload(self.hass, self._entry)
+        await _persist_and_reload(self.hass, self._entry, data)
 
 
 class RemoveZoneButton(ButtonEntity):
@@ -140,7 +146,8 @@ class RemoveZoneButton(ButtonEntity):
 
     async def async_press(self) -> None:
         _assert_layout_editable(self.hass, self._entry, self._device_id)
-        device = self._entry.data[CONF_DEVICES][self._device_id]
+        data = copy.deepcopy(dict(self._entry.data))
+        device = data[CONF_DEVICES][self._device_id]
         sync = _sync(device)
         zones = list(sync.get("zones") or [])
         if self._index >= len(zones):
@@ -148,7 +155,7 @@ class RemoveZoneButton(ButtonEntity):
         zones.pop(self._index)
         sync["zones"] = zones
         device["screen_sync"] = sync
-        await _persist_and_reload(self.hass, self._entry)
+        await _persist_and_reload(self.hass, self._entry, data)
 
 
 async def async_add_numbers(hass, entry, async_add_entities):
@@ -193,4 +200,7 @@ async def async_start_hub(hass, entry):
 
 
 async def async_add_switches(hass, entry, async_add_entities):
-    async_add_entities([])
+    from .screen_output import ScreenEdgesMasterSwitch
+
+    if any(_zones(device) for _, device in _strip_devices(entry)):
+        async_add_entities([ScreenEdgesMasterSwitch(entry)])

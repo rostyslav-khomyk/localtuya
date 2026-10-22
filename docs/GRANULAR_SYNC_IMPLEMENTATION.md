@@ -46,3 +46,14 @@ At the agreed window:
 6. Keep the existing single bottom desk zone until lengths and controller direction are confirmed. Add 1d/2d/3d in one configuration change, then map left/bottom/right and reverse as needed.
 
 If this acceptance check fails, stop the new app and restore both previous component and app artifacts plus the Mac config backup. Use one planned rollback HA restart if Python code was replaced. Return to ordinary manual lighting; investigate offline before another release. Do not iterate small patches on the household HA.
+
+
+## Master output and persistent zone settings (2026.10.3)
+
+`ScreenEdges lighting` is one native switch per LocalTuya entry. Its `screen_output_enabled` latch is stored in the config entry. Off takes precedence over manual lighting and stream release, sends 20-section black frames, stops the shared painter and TCP-powers off the configured strips. It rejects new stream claims before connecting to a source. On restores saved manual settings; an enabled Mac client can then resume streaming. The Mac shows "Suspended by Home Assistant" and waits rather than capturing/reclaiming while the selected zones' output is inhibited.
+
+Zone entities report effective off under the master but keep their desired manual on/off, full-brightness RGB and brightness in HA RestoreEntity extra data. Manual commands while the master is off prepare those settings without painting or powering hardware. Manual commands while a stream owns the strip still reject. Pause/Quit while master off cannot restore visible output.
+
+The neon On automation prepares the user's cyan settings while the master is off, then turns it on. Repeated On while already on skips scene preparation so it cannot fight a running stream. Off uses the master instead of overwriting six desired states. Existing MQTT triggers and smart-plug/Wiz actions are retained.
+
+Zone add/remove/length editors now deep-copy entry data before updating HA. Real ConfigEntries tests write the store and instantiate a fresh manager to verify lengths and the Off latch survive, and real restore-state disk tests preserve remembered colors and desired off/on states while output stays off. The previous rename-to-force-save workaround is no longer needed.

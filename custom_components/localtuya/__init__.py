@@ -401,8 +401,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     _drop_extra_zones(hass, entry)
     from .screen_sync import async_start_hub
 
-    await async_start_hub(hass, entry)
+    hub = await async_start_hub(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS.values())
+    await hub.restore_output()
 
     # Note: entry.async_on_unload items are called in LIFO order!
 

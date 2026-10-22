@@ -111,7 +111,14 @@ def hub(monkeypatch):
     async def executor(func, *args):
         return func(*args)
 
-    hass = SimpleNamespace(data={"localtuya": {"zone_hubs": {}}}, async_add_executor_job=executor)
+    def update_entry(entry, *, data):
+        if data == entry.data:
+            return False
+        entry.data = data
+        return True
+
+    hass = SimpleNamespace(data={"localtuya": {"zone_hubs": {}}}, async_add_executor_job=executor,
+                           config_entries=SimpleNamespace(async_update_entry=update_entry))
     result = ZonePaintHub(hass, entry)
     hass.data["localtuya"]["zone_hubs"]["test"] = result
 
@@ -345,6 +352,13 @@ async def ha_http(hub, tmp_path, monkeypatch):
     device_registry.async_setup(hass)
     await device_registry.async_load(hass)
     await entity_registry.async_load(hass)
+    from homeassistant.config_entries import ConfigEntries, ConfigEntry
+    hass.config_entries = ConfigEntries(hass, {})
+    await hass.config_entries.async_initialize()
+    entry = ConfigEntry(domain="localtuya", title="test", source="user", data=hub.entry.data, options={},
+                        version=4, minor_version=1, unique_id=None, discovery_keys={}, subentries_data=[], entry_id="test")
+    hass.config_entries._entries[entry.entry_id] = entry
+    hub.entry = entry
     hass.auth = await auth_manager_from_config(hass, [], [])
     admin = await hass.auth.async_create_user("Offline test administrator", group_ids=[GROUP_ID_ADMIN])
     reader = await hass.auth.async_create_user("Offline read-only test", group_ids=[GROUP_ID_READ_ONLY])
@@ -377,6 +391,7 @@ async def ha_http(hub, tmp_path, monkeypatch):
         await server.stop()
         await source_session.close()
         await hass.async_stop(force=True)
+        hass.data.clear()
 
 
 @pytest.mark.asyncio
@@ -515,3 +530,324 @@ async def test_swift_ha_control_client_acquires_and_releases_real_endpoint(ha_ht
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_master_off_blackouts_both_strips_without_changing_manual_settings(hub):
+    hub.set_zone("monitor", 0, is_on=True, rgb=(12, 34, 56))
+    hub.set_zone("desk", 0, is_on=False, rgb=(0, 0, 0))
+    saved = copy.deepcopy(hub._state)
+    await hub.begin_stream("owner", {"monitor": [(255, 0, 0)] * 20, "desk": [(0, 255, 0)] * 20})
+    marker = len(hub.recorded_frames)
+    await hub.set_output_enabled(False)
+    assert hub.entry.data[zone_lights.CONF_OUTPUT_ENABLED] is False
+    assert not hub._stream_owner and not hub._stream_frames and not hub._powered
+    assert not hub._loop_running() and hub.painting_device_ids() == []
+    assert hub._state == saved
+    assert {did for did, _, _ in hub.recorded_frames[marker:]} == {"monitor", "desk"}
+    assert all(colors == [(0, 0, 0)] * 20 for _, colors, _ in hub.recorded_frames[marker:])
+    assert set(hub.recorded_power[-2:]) == {("monitor", False), ("desk", False)}
+    power_count = len(hub.recorded_power)
+    await hub.set_output_enabled(False)
+    await hub.end_stream("owner")
+    await hub.apply("monitor")
+    with pytest.raises(HomeAssistantError):
+        await hub.begin_stream("retry", {"desk": [(255, 0, 0)] * 20})
+    assert len(hub.recorded_power) == power_count
+    await hub.set_output_enabled(True)
+    assert hub._state == saved and hub.painting_device_ids() == ["monitor"]
+    assert hub._colors_for("monitor")[0][0] == (12, 34, 56)
+    sender = hub.sender
+    await hub.set_output_enabled(True)
+    assert hub.sender is sender
+    await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_master_switch_and_off_zone_survive_restore(hub, monkeypatch):
+    from homeassistant.helpers.restore_state import RestoredExtraData
+    from custom_components.localtuya.screen_output import ScreenEdgesMasterSwitch
+    light = BattletronZoneLight(hub.entry, "monitor", hub._device("monitor"), 0)
+    light.hass = hub.hass
+    light.async_write_ha_state = Mock()
+    light._is_on, light._rgb, light._brightness = True, (80, 40, 20), 0
+    assert light._wire_rgb() == (0, 0, 0)
+    light._brightness = 117
+    desired = light.extra_restore_state_data.as_dict()
+    master = ScreenEdgesMasterSwitch(hub.entry)
+    master.hass, master.async_write_ha_state = hub.hass, Mock()
+    await master.async_turn_off()
+    assert not master.is_on and not light.is_on
+    # Off is authoritative, but automations may prepare the next manual scene.
+    marker = len(hub.recorded_frames)
+    await light.async_turn_on(rgb_color=(0, 253, 255), brightness=117)
+    assert not light.is_on and len(hub.recorded_frames) == marker
+    desired = light.extra_restore_state_data.as_dict()
+    restarted = ZonePaintHub(hub.hass, hub.entry)
+    assert restarted.output_enabled is False
+    hub.hass.data["localtuya"]["zone_hubs"]["test"] = restarted
+    restored = BattletronZoneLight(hub.entry, "monitor", hub._device("monitor"), 0)
+    restored.hass = hub.hass
+    restored.async_get_last_extra_data = AsyncMock(return_value=RestoredExtraData(desired))
+    await restored.async_added_to_hass()
+    assert restored.extra_restore_state_data.as_dict() == desired
+    assert not restored.is_on and not restarted._loop_running()
+    restarted._power_one = hub._power_one
+    restarted._power_off = hub._power_off
+    # Reuse the recording power implementations with the restarted hub's set.
+    async def power_on(did):
+        restarted._powered.add(did)
+    restarted._power_one = AsyncMock(side_effect=power_on)
+    restored.async_write_ha_state = Mock()
+    await master.async_turn_on()
+    assert restored.is_on and restored._rgb == (0, 253, 255) and restored._brightness == 117
+    await restarted.stop()
+    await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_off_gate_rejects_start_before_source_connection(ha_http, hub):
+    url, (admin, _) = ha_http
+    await hub.set_output_enabled(False)
+    async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {admin}"}) as session:
+        async with session.get(url) as response:
+            layout = await response.json()
+        assert all(zone["output_enabled"] is False for zone in layout["zones"])
+        async with session.post(url, json={"action": "start", "owner": "retry", "port": 12345,
+            "token": "valid-token-long-enough", "mappings": [{"entity_id": "light.desk_0", "edge": "bottom"}]}) as response:
+            assert response.status == 409
+            assert (await response.json())["output_enabled"] is False
+        assert hub.stream is None and not hub._stream_owner and not hub._powered
+        controller = StreamController(hub, session)
+        with pytest.raises(HomeAssistantError):
+            await controller.start("retry", "ws://127.0.0.1:12345", "token", {"desk": {0: ("bottom", False)}})
+        assert controller._task is None
+
+
+@pytest.mark.asyncio
+async def test_real_stream_cannot_reclaim_when_master_off_and_can_resume(ha_http, hub):
+    url, (admin, _) = ha_http
+    process, port = await launch_swift_fixture()
+    request = {"action": "start", "owner": "master-test", "port": port,
+               "token": "local-integration-test-token", "mappings": [{"entity_id": "light.desk_0", "edge": "bottom"}]}
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {admin}"}) as session:
+            assert (await session.post(url, json=request)).status == 200
+            await hub.set_output_enabled(False)
+            assert not hub._stream_owner and not hub._powered
+            for _ in range(3):
+                assert (await session.post(url, json=request)).status == 409
+            assert (await session.post(url, json={"action": "stop", "owner": "master-test"})).status == 200
+            assert not hub._stream_owner and not hub._powered
+            await hub.set_output_enabled(True)
+            assert (await session.post(url, json=request)).status == 200
+            assert hub._stream_owner == {"desk": "master-test"}
+            await hub.set_output_enabled(False)
+            process.terminate()
+            await process.wait()
+            assert not hub._stream_owner and not hub._powered
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await process.wait()
+
+
+@pytest.mark.asyncio
+async def test_zone_layout_and_master_flag_really_persist_through_ha_store(tmp_path, monkeypatch):
+    from homeassistant.config_entries import ConfigEntry, ConfigEntries
+    from custom_components.localtuya.screen_sync import ZoneLengthNumber, AddZoneButton, RemoveZoneButton, _save
+    hass = HomeAssistant(str(tmp_path))
+    hass.data["localtuya"] = {}
+    entries = ConfigEntries(hass, {})
+    hass.config_entries = entries
+    await entries.async_initialize()
+    data = {"devices": {"desk": {"screen_sync": {"zones": [{"cm": 300}]}}}}
+    original = copy.deepcopy(data)
+    entry = ConfigEntry(domain="localtuya", title="test", source="user", data=data, options={},
+                        version=4, minor_version=1, unique_id=None, discovery_keys={}, subentries_data=[])
+    entries._entries[entry.entry_id] = entry
+    # Never set up an actual integration or contact devices in this persistence test.
+    entries.async_reload = AsyncMock(return_value=True)
+    number = ZoneLengthNumber(entry, "desk", entry.data["devices"]["desk"], 0)
+    number.hass = hass
+    number.schedule_update_ha_state = Mock()
+    await number.async_set_native_value(180)
+    assert data == original, "The old nested data must not be mutated before HA compares it"
+    for _ in range(2):
+        button = AddZoneButton(entry, "desk", entry.data["devices"]["desk"])
+        button.hass = hass
+        await button.async_press()
+    second = ZoneLengthNumber(entry, "desk", entry.data["devices"]["desk"], 1)
+    second.hass, second.schedule_update_ha_state = hass, Mock()
+    await second.async_set_native_value(90)
+    third = ZoneLengthNumber(entry, "desk", entry.data["devices"]["desk"], 2)
+    third.hass, third.schedule_update_ha_state = hass, Mock()
+    await third.async_set_native_value(30)
+    _save(hass, entry, {**entry.data, zone_lights.CONF_OUTPUT_ENABLED: False})
+    await entries._store.async_save(entries._data_to_save())
+    # A fresh manager reads the saved file, rather than the in-memory config entry.
+    reloaded = ConfigEntries(hass, {})
+    await reloaded.async_initialize()
+    loaded = reloaded.async_get_entry(entry.entry_id)
+    assert [z["cm"] for z in loaded.data["devices"]["desk"]["screen_sync"]["zones"]] == [180, 90, 30]
+    assert loaded.data[zone_lights.CONF_OUTPUT_ENABLED] is False
+    removed = RemoveZoneButton(entry, "desk", entry.data["devices"]["desk"], 2)
+    removed.hass = hass
+    await removed.async_press()
+    await entries._store.async_save(entries._data_to_save())
+    raw = json.loads((tmp_path / ".storage/core.config_entries").read_text())
+    assert len(raw["data"]["entries"][0]["data"]["devices"]["desk"]["screen_sync"]["zones"]) == 2
+    await hass.async_stop(force=True)
+    hass.data.clear()
+
+
+@pytest.mark.asyncio
+async def test_master_off_serializes_with_inflight_power_claim(hub):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_power(did):
+        entered.set()
+        await release.wait()
+        hub._powered.add(did)
+
+    hub._power_one = AsyncMock(side_effect=slow_power)
+    claim = asyncio.create_task(hub.begin_stream("owner", {"desk": [(255, 0, 0)] * 20}))
+    await entered.wait()
+    off = asyncio.create_task(hub.set_output_enabled(False))
+    release.set()
+    await asyncio.gather(claim, off, return_exceptions=True)
+    assert not hub.output_enabled and not hub._stream_owner and not hub._powered
+    marker = len(hub.recorded_frames)
+    await hub.end_stream("owner")
+    await asyncio.sleep(0.03)
+    assert len(hub.recorded_frames) == marker
+    await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_neon_automation_actions_execute_safely_with_native_ha_script(ha_http, hub):
+    from homeassistant.helpers.script import Script
+    from homeassistant.helpers import config_validation as cv
+    from homeassistant.core import Context
+    from custom_components.localtuya.screen_output import ScreenEdgesMasterSwitch
+
+    hass = hub.hass
+    hub.entry.data["devices"]["desk"]["screen_sync"]["zones"] = [{"cm": 180}, {"cm": 90}, {"cm": 30}]
+    hub.lights.clear()
+    lights = {}
+    master_id = "switch.screenedges_lighting"
+    master = ScreenEdgesMasterSwitch(hub.entry)
+    master.hass, master.entity_id = hass, master_id
+    master.async_write_ha_state = lambda: hass.states.async_set(master_id, "on" if master.is_on else "off")
+    for did in ("monitor", "desk"):
+        for i in range(3):
+            light = BattletronZoneLight(hub.entry, did, hub._device(did), i)
+            light.hass, light.entity_id = hass, f"light.{did}_{i}"
+            light.async_write_ha_state = lambda entity=light: hass.states.async_set(entity.entity_id, "on" if entity.is_on else "off")
+            lights[light.entity_id] = light
+            hub.lights[(did, i)] = light
+    calls = []
+
+    async def switch_service(call):
+        target = call.data["entity_id"]
+        target = [target] if isinstance(target, str) else target
+        for eid in target:
+            calls.append((call.service, eid))
+            if eid == master_id:
+                await (master.async_turn_on() if call.service == "turn_on" else master.async_turn_off())
+            else:
+                hass.states.async_set(eid, "on" if call.service == "turn_on" else "off")
+
+    async def light_service(call):
+        targets = call.data["entity_id"]
+        targets = [targets] if isinstance(targets, str) else targets
+        for eid in targets:
+            calls.append((call.service, eid))
+            if eid in lights:
+                assert not hub.output_enabled, "Scene preparation must finish before streaming may resume"
+                await lights[eid].async_turn_on(rgb_color=call.data["rgb_color"])
+            else:
+                hass.states.async_set(eid, "on" if call.service == "turn_on" else "off")
+
+    for service in ("turn_on", "turn_off"):
+        hass.services.async_register("switch", service, switch_service)
+        hass.services.async_register("light", service, light_service)
+    await master.async_turn_off()
+    on_actions = [
+        {"if": [{"condition": "state", "entity_id": master_id, "state": "off"}], "then": [
+            {"action": "light.turn_on", "target": {"entity_id": list(lights)}, "data": {"rgb_color": [0, 253, 255]}}]},
+        {"action": "switch.turn_on", "target": {"entity_id": master_id}},
+        {"action": "switch.turn_on", "target": {"entity_id": "switch.old_plug"}},
+        {"action": "light.turn_on", "target": {"entity_id": "light.old_wiz"}},
+    ]
+    off_actions = [
+        {"action": "switch.turn_off", "target": {"entity_id": master_id}},
+        {"action": "switch.turn_off", "target": {"entity_id": "switch.old_plug"}},
+        {"action": "light.turn_off", "target": {"entity_id": "light.old_wiz"}},
+    ]
+    on = Script(hass, cv.SCRIPT_SCHEMA(on_actions), "neon on", "automation")
+    off = Script(hass, cv.SCRIPT_SCHEMA(off_actions), "neon off", "automation")
+    try:
+        await on.async_run(context=Context())
+        assert master.is_on and all(light.is_on and light._rgb == (0, 253, 255) for light in lights.values())
+        assert calls[:6] == [("turn_on", eid) for eid in lights]
+        saved = copy.deepcopy(hub._state)
+        await hub.begin_stream("owner", {"desk": [(255, 0, 0)] * 20, "monitor": [(0, 0, 255)] * 20})
+        sender = hub.sender
+        await on.async_run(context=Context())
+        assert hub.sender is sender and hub._state == saved
+        calls.clear()
+        await off.async_run(context=Context())
+        assert calls == [("turn_off", master_id), ("turn_off", "switch.old_plug"), ("turn_off", "light.old_wiz")]
+        assert not hub.output_enabled and not hub._stream_owner and not hub._powered
+        assert hub._state == saved and all(not light.is_on for light in lights.values())
+        await hub.end_stream("owner")
+        assert not hub._powered
+        await on.async_run(context=Context())
+        assert all(light.is_on for light in lights.values())
+    finally:
+        await on.async_unload()
+        await off.async_unload()
+        for service in ("turn_on", "turn_off"):
+            hass.services.async_remove("switch", service)
+            hass.services.async_remove("light", service)
+        hub.lights.clear()
+        for light in lights.values():
+            light.async_write_ha_state = Mock()
+        master.async_write_ha_state = Mock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("desired_on", [False, True])
+async def test_zone_manual_settings_restore_from_real_ha_disk_while_master_off(hub, tmp_path, desired_on):
+    from homeassistant.helpers import restore_state
+    first = HomeAssistant(str(tmp_path))
+    first.data["localtuya"] = {"zone_hubs": {"test": hub}}
+    hub.hass = first
+    hub.output_enabled = False
+    hub.entry.data[zone_lights.CONF_OUTPUT_ENABLED] = False
+    light = BattletronZoneLight(hub.entry, "monitor", hub._device("monitor"), 0)
+    light.hass, light.entity_id = first, "light.persisted_monitor"
+    light._is_on, light._rgb, light._brightness = desired_on, (91, 43, 17), 123
+    first.states.async_set(light.entity_id, "off")
+    saved = restore_state.async_get(first)
+    await saved.async_load()
+    saved.async_restore_entity_added(light)
+    await saved.async_dump_states()
+    second = HomeAssistant(str(tmp_path))
+    await restore_state.async_load(second)
+    restarted = ZonePaintHub(second, hub.entry)
+    second.data["localtuya"] = {"zone_hubs": {"test": restarted}}
+    restored = BattletronZoneLight(hub.entry, "monitor", hub._device("monitor"), 0)
+    restored.hass, restored.entity_id = second, light.entity_id
+    await restored.async_added_to_hass()
+    assert restored._is_on is desired_on
+    assert restored._rgb == (91, 43, 17) and restored._brightness == 123
+    assert restored.is_on is False and not restarted.output_enabled
+    assert not restarted._powered and not restarted._loop_running()
+    await restarted.stop()
+    await hub.stop()
+    await first.async_stop(force=True)
+    await second.async_stop(force=True)
+    first.data.clear()
+    second.data.clear()

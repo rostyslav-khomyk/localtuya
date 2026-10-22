@@ -29,6 +29,8 @@ class StreamController:
         self.error = None
 
     async def start(self, owner, url, token, bindings):
+        if not self.hub.output_enabled:
+            raise HomeAssistantError("ScreenEdges lighting is off")
         spec = (owner, url, token, bindings)
         if self._task and not self._task.done():
             if self.owner != owner:
@@ -127,6 +129,7 @@ class ScreenStreamView(HomeAssistantView):
                     "device_name": device.get("friendly_name") or device.get("name") or did,
                     "cm": int(zones[index]["cm"]), "sections": counts[index],
                     "screen_sync_active": did in hub._stream_owner,
+                    "output_enabled": hub.output_enabled,
                 }))
         return rows
 
@@ -186,6 +189,8 @@ class ScreenStreamView(HomeAssistantView):
                     selected_hub = hub
                     seen.add(entity)
                     bindings.setdefault(did, {})[index] = (edge, reverse)
+                if not selected_hub.output_enabled:
+                    return self.json({"error": "ScreenEdges lighting is off", "output_enabled": False}, status_code=409)
                 # Use only the authenticated caller's IP, never a supplied URL/host.
                 source = ipaddress.ip_address(request.remote)
                 host = f"[{source}]" if source.version == 6 else str(source)

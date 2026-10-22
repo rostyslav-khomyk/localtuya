@@ -20,6 +20,7 @@ from homeassistant.components.light import (
 )
 from homeassistant.const import CONF_DEVICES, CONF_HOST
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity, RestoredExtraData
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import color as color_util
 
@@ -31,6 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONF_ZONES = "zones"
 CONF_SCREEN_SYNC = "screen_sync"
+CONF_OUTPUT_ENABLED = "screen_output_enabled"
 
 
 def _sync(device: dict) -> dict:
@@ -111,6 +113,8 @@ class ZonePaintHub:
         self._stream_owner: dict[str, str] = {}
         self.stream = None
         self._stopping = False
+        self.output_enabled = entry.data.get(CONF_OUTPUT_ENABLED, True)
+        self._output_lock = asyncio.Lock()
 
     def assert_manual(self, device_id):
         if device_id in self._stream_owner:
@@ -118,8 +122,8 @@ class ZonePaintHub:
 
     async def begin_stream(self, owner, frames):
         async with self._lock:
-            if self._stopping:
-                raise HomeAssistantError("Zone output is shutting down")
+            if self._stopping or not self.output_enabled:
+                raise HomeAssistantError("ScreenEdges lighting is off or shutting down")
             if any(self._stream_owner.get(did, owner) != owner for did in frames):
                 raise HomeAssistantError("Another screen-sync session owns this strip")
             for did, colors in frames.items():
@@ -128,7 +132,7 @@ class ZonePaintHub:
         try:
             for did in frames:
                 await self.apply(did)
-            if any(did not in self._powered for did in frames):
+            if not self.output_enabled or any(did not in self._powered for did in frames):
                 raise HomeAssistantError("Could not power every selected strip")
         except BaseException:
             await self.end_stream(owner)
@@ -136,6 +140,8 @@ class ZonePaintHub:
         self._notify_lights()
 
     def update_stream(self, owner, frames):
+        if not self.output_enabled:
+            raise HomeAssistantError("ScreenEdges lighting is off")
         for did, colors in frames.items():
             if self._stream_owner.get(did) != owner:
                 raise HomeAssistantError("Screen-sync ownership expired")
@@ -147,7 +153,7 @@ class ZonePaintHub:
             for did in ids:
                 self._stream_owner.pop(did)
                 self._stream_frames.pop(did, None)
-        if restore and not self._stopping:
+        if restore and not self._stopping and self.output_enabled:
             for did in ids:
                 await self.apply(did)
         self._notify_lights()
@@ -190,6 +196,8 @@ class ZonePaintHub:
         return {"on": False, "rgb": (0, 0, 0)}
 
     def painting_device_ids(self) -> list[str]:
+        if not self.output_enabled:
+            return []
         out = []
         for device_id, device in (self.entry.data.get(CONF_DEVICES) or {}).items():
             if not _zones(device):
@@ -201,6 +209,8 @@ class ZonePaintHub:
         return out
 
     def _colors_for(self, device_id: str, *, allow_all_off: bool = False):
+        if not self.output_enabled:
+            return [(0, 0, 0)] * 20, [1] * 20
         if device_id in self._stream_frames:
             return self._stream_frames[device_id], [1] * 20
         device = self._device(device_id)
@@ -255,7 +265,7 @@ class ZonePaintHub:
     async def apply(self, device_id: str):
         """Apply current zone state: power if needed, run painter, paint now."""
         async with self._lock:
-            if self._stopping:
+            if self._stopping or not self.output_enabled:
                 return
             device_ids = self.painting_device_ids()
             if device_id not in device_ids:
@@ -400,6 +410,48 @@ class ZonePaintHub:
             # Hold closed — release_tcp() reconnects and can push DP24 orange.
             await tuya.async_hold_tcp()
 
+    async def _blackout_all(self):
+        async with self._lock:
+            for did in list(self.sender._devices):
+                await self.hass.async_add_executor_job(self._paint_now, did, True)
+            await self._stop_loop()
+            self.sender.close()
+            for did, device in self.entry.data.get(CONF_DEVICES, {}).items():
+                if _zones(device):
+                    await self._power_off(did)
+            self._powered.clear()
+            self.sender = ZoneSender()
+
+    async def restore_output(self):
+        if self.output_enabled:
+            await self.refresh()
+        else:
+            await self._blackout_all()
+
+    async def set_output_enabled(self, enabled):
+        from .screen_sync import _save
+
+        async with self._output_lock:
+            async with self._lock:
+                if self._stopping:
+                    raise HomeAssistantError("Zone output is shutting down")
+                if self.output_enabled == enabled:
+                    return
+                # Latch and persist before awaiting any stream/socket cleanup.
+                _save(self.hass, self.entry, {**self.entry.data, CONF_OUTPUT_ENABLED: enabled})
+                self.output_enabled = enabled
+                self._notify_lights()
+            if not enabled:
+                if self.stream is not None:
+                    await self.stream.close(restore=False)
+                async with self._lock:
+                    self._stream_owner.clear()
+                    self._stream_frames.clear()
+                    self._notify_lights()
+                await self._blackout_all()
+            else:
+                await self.refresh()
+
     async def stop_device(self, device_id: str):
         self.assert_manual(device_id)
         for slot in self._ensure_state(device_id):
@@ -418,7 +470,7 @@ class ZonePaintHub:
             self._last_logged.clear()
 
 
-class BattletronZoneLight(LightEntity):
+class BattletronZoneLight(LightEntity, RestoreEntity):
     """One segment of a Battletron strip — standard RGB light."""
 
     _attr_has_entity_name = True
@@ -439,7 +491,8 @@ class BattletronZoneLight(LightEntity):
 
     @property
     def is_on(self) -> bool:
-        return self._is_on
+        hub = self._hub() if self.hass is not None else None
+        return self._is_on and (hub is None or hub.output_enabled)
 
     @property
     def brightness(self) -> int | None:
@@ -453,7 +506,7 @@ class BattletronZoneLight(LightEntity):
         return _hubs(self.hass).get(self._entry.entry_id)
 
     def _wire_rgb(self) -> tuple[int, int, int]:
-        scale = (self._brightness or 255) / 255.0
+        scale = self._brightness / 255.0
         return tuple(min(255, max(0, int(c * scale))) for c in self._rgb)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
@@ -493,18 +546,28 @@ class BattletronZoneLight(LightEntity):
         if not hub:
             return
         hub.lights[(self._device_id, self._index)] = self
-        slot = hub.zone_state(self._device_id, self._index)
-        if slot.get("on"):
-            self._is_on = True
-            rgb = tuple(slot.get("rgb") or (255, 255, 255))
-            peak = max(rgb[0], rgb[1], rgb[2], 1)
-            self._brightness = peak
-            self._rgb = tuple(min(255, int(round(c * 255 / peak))) for c in rgb)
+        extra = await self.async_get_last_extra_data()
+        if extra is not None:
+            saved = extra.as_dict()
+            self._is_on = saved["on"]
+            self._rgb = tuple(saved["rgb"])
+            self._brightness = saved["brightness"]
+        elif (last := await self.async_get_last_state()) is not None:
+            self._is_on = last.state == "on"
+            self._rgb = tuple(last.attributes.get("rgb_color") or (255, 255, 255))
+            self._brightness = last.attributes.get("brightness") or 255
+        hub.set_zone(self._device_id, self._index, is_on=self._is_on, rgb=self._wire_rgb())
+
+    @property
+    def extra_restore_state_data(self):
+        # Preserve desired on/off and remembered color even while the master is off.
+        return RestoredExtraData({"on": self._is_on, "rgb": list(self._rgb), "brightness": self._brightness})
 
     @property
     def extra_state_attributes(self):
         hub = self._hub()
-        return {"screen_sync_active": bool(hub and self._device_id in hub._stream_owner)}
+        return {"screen_sync_active": bool(hub and self._device_id in hub._stream_owner),
+                "screen_output_enabled": bool(hub and hub.output_enabled)}
 
     async def async_will_remove_from_hass(self):
         if hub := self._hub():
@@ -516,7 +579,7 @@ def zones_painting(hass, entry, device_id: str) -> bool:
     hub = _hubs(hass).get(entry.entry_id)
     if not hub:
         return False
-    return device_id in hub._stream_owner or any(s.get("on") for s in hub._ensure_state(device_id))
+    return (not hub.output_enabled and device_has_zones(entry, device_id)) or device_id in hub._stream_owner or any(s.get("on") for s in hub._ensure_state(device_id))
 
 
 async def async_release_zones(device) -> None:
